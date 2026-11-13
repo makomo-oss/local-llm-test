@@ -6,6 +6,7 @@ import type {
   ParsedThinkingOutput,
   QuantDtype,
   ResolvedDtype,
+  TransformersDtype,
 } from '../types.ts';
 
 /**
@@ -222,6 +223,119 @@ export function getModelDownloadBytes(
   return weightsBytes + (includeTokenizer ? model.tokenizerBytes : 0);
 }
 
+/**
+ * Compute expected download size in bytes for text-only execution (`AutoModelForCausalLM`),
+ * factoring in any per-session override tracked on `ResolvedDtype`.
+ */
+export function getResolvedDownloadBytes(
+  model: ModelSpec,
+  resolvedOrDtype: ResolvedDtype | QuantDtype,
+  includeTokenizer = true
+): number {
+  const weightsBytes =
+    typeof resolvedOrDtype === 'string'
+      ? model.textOnlyBytesByDtype[resolvedOrDtype]
+      : (resolvedOrDtype.effectiveWeightsBytes ??
+        model.textOnlyBytesByDtype[resolvedOrDtype.dtype]);
+  return weightsBytes + (includeTokenizer ? model.tokenizerBytes : 0);
+}
+
+interface WasmSplitModelWeightSpec {
+  embedDtype: TransformersDtype;
+  embedBytes: number;
+  decoderBytesByDtype: {
+    q4: number;
+    q8: number;
+  };
+}
+
+/**
+ * Per-session ONNX overrides for split causal-LM models on CPU (WASM).
+ *
+ * Qwen 3.5 and Gemma 4 emit `GatherBlockQuantized(1)` inside `embed_tokens_q4.onnx`
+ * and `embed_tokens_quantized.onnx`, which ONNX Runtime WASM CPU does not implement
+ * (`ERROR_CODE: 9`). `decoder_model_merged` uses `MatMulNBits` + `Gather` cleanly.
+ * - Qwen 3.5 uses `embed_tokens_fp16.onnx` (`Gather` + `Cast` -> float32), halving RAM/disk vs `fp32`.
+ * - Gemma 4 uses `embed_tokens.onnx` (`fp32`) to avoid FP16 `Mul` ops inside `embed_tokens_fp16.onnx`.
+ */
+const WASM_SPLIT_MODEL_WEIGHTS: Partial<Record<ModelId, WasmSplitModelWeightSpec>> = {
+  'qwen-3.5-0.8b': {
+    embedDtype: 'fp16',
+    embedBytes: 508_559_997,
+    decoderBytesByDtype: {
+      q4: 486_301_511,
+      q8: 874_001_726,
+    },
+  },
+  'qwen-3.5-2b': {
+    embedDtype: 'fp16',
+    embedBytes: 1_017_119_358,
+    decoderBytesByDtype: {
+      q4: 1_210_012_894,
+      q8: 2_180_054_057,
+    },
+  },
+  'qwen-3.5-4b': {
+    embedDtype: 'fp16',
+    embedBytes: 1_271_399_038,
+    decoderBytesByDtype: {
+      q4: 2_701_873_617,
+      q8: 4_869_975_241,
+    },
+  },
+  'gemma-4-e2b': {
+    embedDtype: 'fp32',
+    embedBytes: 11_005_857_939,
+    decoderBytesByDtype: {
+      q4: 1_864_750_511,
+      q8: 3_040_111_074,
+    },
+  },
+  'gemma-4-e4b': {
+    embedDtype: 'fp32',
+    embedBytes: 13_958_647_953,
+    decoderBytesByDtype: {
+      q4: 3_380_723_437,
+      q8: 5_775_233_760,
+    },
+  },
+};
+
+function finalizeWasmDtype(
+  model: ModelSpec,
+  decoderDtype: 'q4' | 'q8',
+  requestedDtype: QuantDtype | 'auto' | undefined,
+  fallbackReason?: string,
+  useExternalDataFormat?: true
+): ResolvedDtype {
+  const splitSpec = WASM_SPLIT_MODEL_WEIGHTS[model.id];
+  if (!splitSpec) {
+    return {
+      dtype: decoderDtype,
+      requestedDtype,
+      ...(useExternalDataFormat ? { useExternalDataFormat } : {}),
+      adjusted: Boolean(fallbackReason),
+      ...(fallbackReason ? { reason: fallbackReason } : {}),
+    };
+  }
+
+  const effectiveWeightsBytes =
+    splitSpec.embedBytes + splitSpec.decoderBytesByDtype[decoderDtype];
+  const splitReason = `WASM (CPU) では embed_tokens の GatherBlockQuantized 非対応を回避するため embed_tokens=${splitSpec.embedDtype}・decoder_model_merged=${decoderDtype} を使用します。`;
+
+  return {
+    dtype: decoderDtype,
+    modelDtype: {
+      embed_tokens: splitSpec.embedDtype,
+      decoder_model_merged: decoderDtype,
+    },
+    effectiveWeightsBytes,
+    requestedDtype,
+    adjusted: true,
+    reason: fallbackReason ? `${fallbackReason} ${splitReason}` : splitReason,
+  };
+}
+
 export interface ResolveDtypeOptions {
   /**
    * Explicitly allow `use_external_data_format: true` when `q8` is requested on
@@ -240,6 +354,9 @@ export interface ResolveDtypeOptions {
  * 3. Llama 3.2 3B `q8` omits `model_quantized.onnx` from `config.json`'s
  *    `use_external_data_format` map; it either sets `useExternalDataFormat: true`
  *    when opted-in or falls back safely (`q4f16` / `q4`).
+ * 4. On CPU/WASM, split-session models whose quantized `embed_tokens` contains
+ *    `GatherBlockQuantized` (Qwen 3.5, Gemma 4) use a per-session `modelDtype` map
+ *    (`embed_tokens: 'fp16' | 'fp32'`, `decoder_model_merged: 'q4' | 'q8'`).
  */
 export function resolveEffectiveDtype(
   model: ModelSpec,
@@ -253,57 +370,54 @@ export function resolveEffectiveDtype(
   const webgpuDefault: QuantDtype = hasShaderF16 ? 'q4f16' : 'q4';
 
   if (!requestedDtype || requestedDtype === 'auto') {
-    const dtype: QuantDtype = device.backend === 'wasm' ? 'q4' : webgpuDefault;
+    if (device.backend === 'wasm') {
+      return finalizeWasmDtype(model, 'q4', requestedDtype);
+    }
     return {
-      dtype,
+      dtype: webgpuDefault,
       requestedDtype,
       adjusted: false,
     };
   }
 
-  let candidate: QuantDtype = requestedDtype;
+  const candidate: QuantDtype = requestedDtype;
   if (!model.availableDtypes.includes(candidate)) {
     const fallback = device.backend === 'wasm' ? 'q4' : webgpuDefault;
+    const unsupportedReason = `${model.name} は dtype "${requestedDtype}" に未対応のため ${fallback} にフォールバックしました。`;
+    if (device.backend === 'wasm') {
+      return finalizeWasmDtype(model, 'q4', requestedDtype, unsupportedReason);
+    }
     return {
       dtype: fallback,
       requestedDtype,
       adjusted: true,
-      reason: `${model.name} は dtype "${requestedDtype}" に未対応のため ${fallback} にフォールバックしました。`,
+      reason: unsupportedReason,
     };
   }
 
   if (device.backend === 'wasm') {
     if (candidate === 'q4f16' || candidate === 'fp16') {
-      return {
-        dtype: 'q4',
+      return finalizeWasmDtype(
+        model,
+        'q4',
         requestedDtype,
-        adjusted: true,
-        reason: `WASM (CPU) バックエンドでは ${candidate} を使用できないため q4 にフォールバックしました。`,
-      };
+        `WASM (CPU) バックエンドでは ${candidate} を使用できないため q4 にフォールバックしました。`
+      );
     }
 
     if (candidate === 'q8' && model.requiresExplicitExternalDataForQ8) {
       if (options?.useExternalDataFormat) {
-        return {
-          dtype: 'q8',
-          requestedDtype,
-          useExternalDataFormat: true,
-          adjusted: false,
-        };
+        return finalizeWasmDtype(model, 'q8', requestedDtype, undefined, true);
       }
-      return {
-        dtype: 'q4',
+      return finalizeWasmDtype(
+        model,
+        'q4',
         requestedDtype,
-        adjusted: true,
-        reason: `${model.name} の q8 は use_external_data_format: true 指定が必要なため安全な q4 にフォールバックしました。`,
-      };
+        `${model.name} の q8 は use_external_data_format: true 指定が必要なため安全な q4 にフォールバックしました。`
+      );
     }
 
-    return {
-      dtype: candidate,
-      requestedDtype,
-      adjusted: false,
-    };
+    return finalizeWasmDtype(model, candidate, requestedDtype);
   }
 
   // WebGPU backend

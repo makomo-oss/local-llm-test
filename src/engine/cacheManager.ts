@@ -6,8 +6,6 @@ import type { ModelCacheEntry, ModelCacheInfo, ModelId, ModelSpec } from '../typ
  */
 export const TRANSFORMERS_CACHE_NAME = 'transformers-cache';
 
-const LARGE_BINARY_FILE_REGEX = /\.(?:onnx(?:_data(?:_\d+)?)?|bin|safetensors|wasm)$/i;
-
 export interface ClearModelCacheResult {
   clearedBytes: number;
   deletedEntries: number;
@@ -97,40 +95,57 @@ function normalizeRepoTailToFile(tail: string): string | null {
   return tail;
 }
 
+function parseHeaderByteLength(headers: Headers | undefined, name: string): number | undefined {
+  const rawLength = headers?.get?.(name);
+  if (typeof rawLength !== 'string' || rawLength.trim().length === 0) {
+    return undefined;
+  }
+  const parsed = Number(rawLength.trim());
+  if (Number.isFinite(parsed) && parsed >= 0) {
+    return Math.floor(parsed);
+  }
+  return undefined;
+}
+
 /**
- * Determine cached response byte size without reading gigabyte weight files into RAM.
- * Always inspects `content-length` header first, falling back to `blob().size` only for
- * small non-weight files when the header is missing.
+ * Determine cached response byte size without reading gigabyte weight files into JS heap.
+ *
+ * Checks `content-length` first when the payload is uncompressed (`content-encoding`
+ * absent or `identity`), then `x-linked-size` (Hugging Face LFS/Xet uncompressed size),
+ * and finally falls back to `clone().blob().size` (metadata-backed in Chromium CacheStorage).
  */
 export async function measureCachedResponseBytes(
   response: Response | undefined,
-  fileHint: string
+  _fileHint = ''
 ): Promise<number> {
   if (!response) {
     return 0;
   }
 
-  const rawLength = response.headers?.get?.('content-length');
-  if (typeof rawLength === 'string' && rawLength.trim().length > 0) {
-    const parsed = Number(rawLength.trim());
-    if (Number.isFinite(parsed) && parsed >= 0) {
-      return Math.floor(parsed);
+  const contentEncoding = response.headers?.get?.('content-encoding')?.trim().toLowerCase();
+  const isIdentityEncoding = !contentEncoding || contentEncoding === 'identity';
+  if (isIdentityEncoding) {
+    const contentLength = parseHeaderByteLength(response.headers, 'content-length');
+    if (contentLength !== undefined) {
+      return contentLength;
     }
   }
 
-  if (LARGE_BINARY_FILE_REGEX.test(fileHint)) {
-    return 0;
+  const linkedSize = parseHeaderByteLength(response.headers, 'x-linked-size');
+  if (linkedSize !== undefined) {
+    return linkedSize;
   }
 
-  if (typeof response.blob === 'function') {
-    try {
-      const blob = await response.blob();
+  try {
+    const source = typeof response.clone === 'function' ? response.clone() : response;
+    if (typeof source.blob === 'function') {
+      const blob = await source.blob();
       if (typeof blob?.size === 'number' && Number.isFinite(blob.size) && blob.size >= 0) {
         return Math.floor(blob.size);
       }
-    } catch {
-      return 0;
     }
+  } catch {
+    return 0;
   }
 
   return 0;

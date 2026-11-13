@@ -20,6 +20,12 @@ export type ModelFamily = 'gemma4' | 'qwen3_5' | 'llama';
 export type QuantDtype = 'q4f16' | 'q4' | 'q8' | 'fp16';
 
 /**
+ * Runtime ONNX session dtypes accepted by Transformers.js `from_pretrained`,
+ * including `fp32` used for per-session overrides on CPU (WASM).
+ */
+export type TransformersDtype = QuantDtype | 'fp32';
+
+/**
  * Execution backends available in the browser.
  */
 export type ExecutionBackend = 'webgpu' | 'wasm';
@@ -106,6 +112,18 @@ export interface ModelSpec {
  */
 export interface ResolvedDtype {
   dtype: QuantDtype;
+  /**
+   * Actual value passed to Transformers.js `from_pretrained({ dtype })`.
+   * May be a per-session dtype map (e.g. `{ embed_tokens: 'fp16', decoder_model_merged: 'q4' }`)
+   * when a backend requires avoiding quantized ops such as `GatherBlockQuantized` on WASM.
+   * Defaults to `dtype` when omitted.
+   */
+  modelDtype?: TransformersDtype | Record<string, TransformersDtype>;
+  /**
+   * Total weight bytes corresponding to `modelDtype` when per-session overrides alter download size.
+   * Falls back to `model.textOnlyBytesByDtype[dtype]` when omitted.
+   */
+  effectiveWeightsBytes?: number;
   requestedDtype?: QuantDtype | 'auto';
   /**
    * Defined as `true` only when `from_pretrained` must override `config.json`
