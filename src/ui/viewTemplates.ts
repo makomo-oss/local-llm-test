@@ -1,4 +1,4 @@
-import { formatBytes, getModelDownloadBytes } from '../models/catalog.ts';
+import { formatBytes, getResolvedDownloadBytes } from '../models/catalog.ts';
 import type {
   BenchmarkComparisonResult,
   BenchmarkSummaryStats,
@@ -118,7 +118,7 @@ export function renderModelCardsHtml(input: ModelCardsViewInput): string {
       const resolved = input.resolveDtypeFn(model, fallbackDevice, input.requestedDtype, {
         useExternalDataFormat: input.useExternalDataFormat,
       });
-      const downloadBytes = getModelDownloadBytes(model, resolved.dtype, true);
+      const downloadBytes = getResolvedDownloadBytes(model, resolved, true);
       const cache = input.cacheMap.get(model.id);
       const cacheBadge = cache?.cached
         ? `<span class="chip chip--cached">✓ キャッシュ済 (${escapeHtml(formatBytes(cache.cachedBytes))})</span>`

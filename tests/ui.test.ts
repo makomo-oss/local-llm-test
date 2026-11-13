@@ -825,6 +825,19 @@ describe('viewTemplates & SVG comparison charts', () => {
     expect(html).toContain('✓ キャッシュ済');
     expect(html).toContain('未ダウンロード');
     expect(html).toContain('ロード済');
+
+    const wasmHtml = renderModelCardsHtml({
+      models: MODEL_CATALOG,
+      selectedModelId: 'qwen-3.5-0.8b',
+      loadedModelId: null,
+      selectedDevice: CPU_WASM_DEVICE,
+      requestedDtype: 'auto',
+      useExternalDataFormat: false,
+      cacheMap: new Map(),
+      resolveDtypeFn: resolveEffectiveDtype,
+    });
+    expect(wasmHtml).toContain('967.1 MiB');
+    expect(wasmHtml).not.toContain('637.5 MiB');
   });
 
   it('renders accessible SVG bar charts, winner cards, and responsive comparison table', () => {
@@ -1320,6 +1333,64 @@ describe('DebouncedLiveAnnouncer & AppController integration', () => {
     expect(mockClient.unloadModel).toHaveBeenCalledTimes(1);
     expect(controller.getStateSnapshot().loadedState).toBeNull();
 
+    controller.dispose();
+  });
+
+  it('displays resolved WASM split-dtype download sizes (e.g. 967.1 MiB for Qwen 3.5 0.8B) in preview, cards, and initial load progress', async () => {
+    const root = fakeDoc.createElement('div');
+    fakeDoc.body.appendChild(root);
+
+    let resolveLoad!: () => void;
+    const mockClient = {
+      probeDevices: vi.fn(async () => [GPU_DEVICE_F16, CPU_WASM_DEVICE]),
+      loadModel: vi.fn(
+        () =>
+          new Promise((res) => {
+            resolveLoad = () =>
+              res({
+                modelId: 'qwen-3.5-0.8b',
+                device: CPU_WASM_DEVICE,
+                effectiveDtype: 'q4',
+                useExternalDataFormat: false,
+                loadTimeMs: 100,
+              });
+          })
+      ),
+      generate: vi.fn(),
+      abort: vi.fn(),
+      unloadModel: vi.fn(async () => undefined),
+      inspectCache: vi.fn(async () => []),
+      clearCache: vi.fn(),
+      dispose: vi.fn(),
+    } as unknown as LlmRuntimeClient;
+
+    const controller = new AppController(root as unknown as HTMLElement, {
+      client: mockClient,
+      benchmarkStore: new BenchmarkStore({ storage: null }),
+      themeStorage: createMemoryStorage(),
+      getStorageEstimateFn: async () => ({}),
+      sampleBatteryFn: async () => ({ supported: false, sampledAt: 1 }),
+      observeBatteryFn: async () => () => {},
+      telemetryEnv: { requestAnimationFrame: null, PerformanceObserver: null },
+    });
+
+    await controller.init();
+
+    root.querySelector('button[data-select-model="qwen-3.5-0.8b"]')!.click();
+    const deviceSelect = root.querySelector('#device-select')!;
+    deviceSelect.value = CPU_WASM_DEVICE.id;
+    deviceSelect.dispatchEvent(new FakeEvent('change'));
+
+    const previewHtml = root.querySelector('#dtype-preview-box')!.innerHTML;
+    expect(previewHtml).toContain('967.1 MiB');
+    expect(previewHtml).not.toContain('637.5 MiB');
+    expect(root.querySelector('#model-list')!.innerHTML).toContain('967.1 MiB');
+
+    const loadPromise = controller.handleLoadModel();
+    expect(root.querySelector('#load-progress-slot')!.innerHTML).toContain('0 B / 967.1 MiB');
+
+    resolveLoad();
+    await loadPromise;
     controller.dispose();
   });
 });

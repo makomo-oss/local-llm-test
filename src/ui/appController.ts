@@ -13,7 +13,7 @@ import {
   MODEL_CATALOG,
   formatBytes,
   getModelById,
-  getModelDownloadBytes,
+  getResolvedDownloadBytes,
   parseThinkingOutput,
   resolveEffectiveDtype,
 } from '../models/catalog.ts';
@@ -1051,7 +1051,7 @@ export class AppController {
 
     // Sync dtype preview box
     const resolved = this.getEffectiveDtypeResolution();
-    const expectedBytes = getModelDownloadBytes(model, resolved.dtype, true);
+    const expectedBytes = getResolvedDownloadBytes(model, resolved, true);
     const previewEl = this.root.querySelector<HTMLElement>('#dtype-preview-box');
     if (previewEl) {
       previewEl.className = resolved.adjusted
@@ -1360,7 +1360,7 @@ export class AppController {
       message: `${model.name} (${resolved.dtype}) のロードを開始します...`,
       overallProgressPct: 0,
       loadedBytes: 0,
-      expectedTotalBytes: getModelDownloadBytes(model, resolved.dtype, true),
+      expectedTotalBytes: getResolvedDownloadBytes(model, resolved, true),
       files: [],
     };
     this.statusBanner = null;
