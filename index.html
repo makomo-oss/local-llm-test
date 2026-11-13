@@ -1,9 +1,20 @@
 <!doctype html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Local LLM Benchmark &amp; Chat</title>
+    <meta name="color-scheme" content="light dark" />
+    <title>完全ブラウザ完結型ローカルLLM推論・ベンチマークスタジオ</title>
+    <script>
+      try {
+        var savedTheme = localStorage.getItem('local-llm-test:theme');
+        if (savedTheme === 'light' || savedTheme === 'dark') {
+          document.documentElement.dataset.theme = savedTheme;
+        }
+      } catch (_err) {
+        // Ignore storage errors in restricted contexts.
+      }
+    </script>
   </head>
   <body>
     <div id="app"></div>

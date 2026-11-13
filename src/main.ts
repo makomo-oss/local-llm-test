@@ -1,5 +1,16 @@
+import './styles/tokens.css';
+import './styles/main.css';
+import { AppController } from './ui/appController.ts';
+
 const root = document.getElementById('app');
 
 if (root) {
-  root.textContent = 'Local LLM Test — ready for implementation.';
+  const controller = new AppController(root);
+  void controller.init();
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', () => {
+      controller.dispose();
+    });
+  }
 }
