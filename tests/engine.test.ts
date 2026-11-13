@@ -5,6 +5,7 @@ import {
   extractModelFileFromCacheUrl,
   getBrowserStorageEstimate,
   inspectModelCaches,
+  measureCachedResponseBytes,
 } from '../src/engine/cacheManager.ts';
 import {
   computeSpeedMetrics,
@@ -16,7 +17,12 @@ import {
   LlmRuntimeError,
   type WorkerLike,
 } from '../src/engine/runtimeClient.ts';
-import { getModelById, getModelDownloadBytes } from '../src/models/catalog.ts';
+import {
+  getModelById,
+  getModelDownloadBytes,
+  getResolvedDownloadBytes,
+  resolveEffectiveDtype,
+} from '../src/models/catalog.ts';
 import type {
   DeviceOption,
   GenerationConfig,
@@ -27,8 +33,11 @@ import type {
 
 interface MockCacheEntrySpec {
   contentLength?: string;
+  xLinkedSize?: string;
+  contentEncoding?: string;
   blobBytes?: number;
   throwOnBlob?: boolean;
+  hasClone?: boolean;
 }
 
 function createMockCacheStorage(
@@ -54,18 +63,32 @@ function createMockCacheStorage(
         }
         const blobSpy = vi.fn(async () => {
           if (spec.throwOnBlob) {
-            throw new Error('Must not read large weights into RAM');
+            throw new Error('Failed to inspect cached blob');
           }
           return new Blob([new Uint8Array(spec.blobBytes ?? 0)]);
         });
         blobSpies.set(url, blobSpy);
 
-        return {
-          headers: new Headers(
-            spec.contentLength !== undefined ? { 'content-length': spec.contentLength } : {}
-          ),
+        const headerEntries: Record<string, string> = {};
+        if (spec.contentLength !== undefined) {
+          headerEntries['content-length'] = spec.contentLength;
+        }
+        if (spec.xLinkedSize !== undefined) {
+          headerEntries['x-linked-size'] = spec.xLinkedSize;
+        }
+        if (spec.contentEncoding !== undefined) {
+          headerEntries['content-encoding'] = spec.contentEncoding;
+        }
+
+        const responseMock: Partial<Response> = {
+          headers: new Headers(headerEntries),
           blob: blobSpy,
-        } as unknown as Response;
+        };
+        if (spec.hasClone !== false) {
+          responseMock.clone = () => responseMock as Response;
+        }
+
+        return responseMock as Response;
       }),
       delete: vi.fn(async (req: RequestInfo | URL) => {
         const url = typeof req === 'string' ? req : req instanceof URL ? req.href : req.url;
@@ -224,8 +247,12 @@ describe('cacheManager', () => {
 
     const qwenWeightUrl =
       'https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX/resolve/main/onnx/decoder_model_merged_q4f16.onnx_data';
+    const qwenLinkedWeightUrl =
+      'https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX/resolve/main/onnx/decoder_model_merged_q4.onnx_data';
     const qwenMissingHeaderWeightUrl =
       'https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX/resolve/main/onnx/embed_tokens_q4f16.onnx';
+    const qwenMissingHeaderDataUrl =
+      'https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX/resolve/main/onnx/embed_tokens_fp16.onnx_data';
     const qwenConfigUrl =
       'https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX/resolve/main/config.json';
     const gemmaTokenizerUrl =
@@ -236,7 +263,9 @@ describe('cacheManager', () => {
     const mock = createMockCacheStorage({
       [TRANSFORMERS_CACHE_NAME]: {
         [qwenWeightUrl]: { contentLength: '584000000', throwOnBlob: true },
-        [qwenMissingHeaderWeightUrl]: { throwOnBlob: true },
+        [qwenLinkedWeightUrl]: { xLinkedSize: '285000000', throwOnBlob: true },
+        [qwenMissingHeaderWeightUrl]: { blobBytes: 440_700 },
+        [qwenMissingHeaderDataUrl]: { throwOnBlob: true, hasClone: false },
         [qwenConfigUrl]: { blobBytes: 1200 },
         [gemmaTokenizerUrl]: { contentLength: '19439251', throwOnBlob: true },
         [wasmRuntimeUrl]: { contentLength: '26861770', throwOnBlob: true },
@@ -251,14 +280,16 @@ describe('cacheManager', () => {
     ]);
 
     expect(mock.blobSpies.get(qwenWeightUrl)).not.toHaveBeenCalled();
-    expect(mock.blobSpies.get(qwenMissingHeaderWeightUrl)).not.toHaveBeenCalled();
+    expect(mock.blobSpies.get(qwenLinkedWeightUrl)).not.toHaveBeenCalled();
+    expect(mock.blobSpies.get(qwenMissingHeaderWeightUrl)).toHaveBeenCalledTimes(1);
+    expect(mock.blobSpies.get(qwenMissingHeaderDataUrl)).toHaveBeenCalledTimes(1);
     expect(mock.blobSpies.get(qwenConfigUrl)).toHaveBeenCalledTimes(1);
 
     expect(results[0]).toMatchObject({
       modelId: 'qwen-3.5-0.8b',
       cached: true,
-      cachedBytes: 584_001_200,
-      fileCount: 3,
+      cachedBytes: 584_000_000 + 285_000_000 + 440_700 + 1_200,
+      fileCount: 5,
     });
     expect(results[1]).toMatchObject({
       modelId: 'gemma-4-e2b',
@@ -272,6 +303,21 @@ describe('cacheManager', () => {
       cachedBytes: 0,
       fileCount: 0,
     });
+
+    // Compressed assets (e.g. CDN .wasm with content-encoding: br) must measure uncompressed blob size
+    const compressedWasmResponse = {
+      headers: new Headers({
+        'content-encoding': 'br',
+        'content-length': '4704500',
+      }),
+      clone() {
+        return this;
+      },
+      blob: async () => ({ size: 26_861_777 }) as Blob,
+    } as unknown as Response;
+    expect(
+      await measureCachedResponseBytes(compressedWasmResponse, 'ort-wasm-simd-threaded.jsep.wasm')
+    ).toBe(26_861_777);
   });
 
   it('clears a single model cache or deletes the entire transformers-cache bucket', async () => {
@@ -449,6 +495,25 @@ describe('llm.worker pure helpers', () => {
     });
     expect(done?.stage).toBe('initializing-session');
     expect(done?.overallProgressPct).toBe(99);
+  });
+
+  it('uses ResolvedDtype effectiveWeightsBytes for WASM split embed_tokens downloads', () => {
+    const qwen = getModelById('qwen-3.5-0.8b');
+    const resolved = resolveEffectiveDtype(
+      qwen,
+      { backend: 'wasm', supportsFp16: false, features: [] },
+      'q4'
+    );
+    const aggregator = createDownloadProgressAggregator(qwen, resolved);
+    const expectedWasmBytes = getResolvedDownloadBytes(qwen, resolved, true);
+
+    expect(expectedWasmBytes).toBe(994_861_508 + qwen.tokenizerBytes);
+    const init = aggregator.handle({
+      status: 'initiate',
+      name: qwen.repoId,
+      file: 'onnx/embed_tokens_fp16.onnx_data',
+    });
+    expect(init?.expectedTotalBytes).toBe(expectedWasmBytes);
   });
 });
 

@@ -11,7 +11,7 @@ import {
 } from '@huggingface/transformers';
 import {
   getModelById,
-  getModelDownloadBytes,
+  getResolvedDownloadBytes,
   parseThinkingOutput,
   resolveEffectiveDtype,
 } from '../models/catalog.ts';
@@ -24,6 +24,7 @@ import type {
   ModelLoadStage,
   ModelSpec,
   QuantDtype,
+  ResolvedDtype,
   WorkerDeviceTarget,
   WorkerRequest,
   WorkerResponse,
@@ -139,10 +140,10 @@ interface ProgressAggregator {
  */
 export function createDownloadProgressAggregator(
   model: ModelSpec,
-  effectiveDtype: QuantDtype
+  effectiveDtype: ResolvedDtype | QuantDtype
 ): ProgressAggregator {
   const fileMap = new Map<string, DownloadFileProgress>();
-  const catalogExpectedBytes = getModelDownloadBytes(model, effectiveDtype, true);
+  const catalogExpectedBytes = getResolvedDownloadBytes(model, effectiveDtype, true);
   let lastEmitAtMs = -Infinity;
   let lastEmittedPct = -1;
 
@@ -618,7 +619,7 @@ async function handleLoadModel(
       notices.push(resolved.reason);
     }
 
-    const aggregator = createDownloadProgressAggregator(modelSpec, resolved.dtype);
+    const aggregator = createDownloadProgressAggregator(modelSpec, resolved);
     let sessionStageEmitted = false;
 
     const progressCallback = (info: ProgressInfo): void => {
@@ -652,7 +653,7 @@ async function handleLoadModel(
 
     const modelOptions: PretrainedModelOptions = {
       device: deviceOption.backend,
-      dtype: resolved.dtype,
+      dtype: (resolved.modelDtype ?? resolved.dtype) as PretrainedModelOptions['dtype'],
       progress_callback: progressCallback,
       ...(resolved.useExternalDataFormat === true ? { use_external_data_format: true } : {}),
       ...(deviceOption.backend === 'webgpu' && acquiredGpu
