@@ -36,6 +36,7 @@ export class StudioDialogHost {
     const dialog = document.createElement('dialog');
     dialog.className = 'studio-dialog';
     dialog.setAttribute('aria-labelledby', titleId);
+    dialog.setAttribute('closedby', 'any');
     dialog.innerHTML = innerHtml;
 
     const handleClose = (): void => {
@@ -51,8 +52,12 @@ export class StudioDialogHost {
 
     dialog.addEventListener('close', handleClose);
 
-    // Handle action buttons with data-dialog-action="confirm" | "cancel"
+    // Handle backdrop light-dismiss and action buttons with data-dialog-action="confirm" | "cancel"
     dialog.addEventListener('click', (event) => {
+      if (event.target === dialog) {
+        dialog.close('backdrop');
+        return;
+      }
       const target = event.target as HTMLElement | null;
       const actionBtn = target?.closest<HTMLButtonElement>('button[data-dialog-action]');
       if (!actionBtn) {

@@ -601,7 +601,7 @@ export class AppController {
                     <textarea
                       id="chat-prompt-input"
                       class="composer-textarea"
-                      rows="3"
+                      rows="2"
                       placeholder="質問やベンチマーク用プロンプトを入力... (Enter で送信 / Shift+Enter で改行 / IME変換中は誤送信しません)"
                     ></textarea>
                   </div>

@@ -291,7 +291,7 @@ export function renderTelemetryHudHtml(input: {
       heapUnavailable = false;
       jsHeapText = formatBytes(liveSnapshot.memory.jsHeapUsedBytes);
     } else {
-      jsHeapText = '非公開 (ブラウザ非対応)';
+      jsHeapText = '非公開 (非対応)';
     }
     uaMemText =
       liveSnapshot.memory.uaMemoryBytes !== undefined
@@ -307,7 +307,7 @@ export function renderTelemetryHudHtml(input: {
       heapUnavailable = false;
       jsHeapText = formatBytes(l.jsHeapUsedBytes);
     } else {
-      jsHeapText = '非公開 (ブラウザ非対応)';
+      jsHeapText = '非公開 (非対応)';
     }
     uaMemText = l.uaMemoryBytes !== undefined ? formatBytes(l.uaMemoryBytes) : 'COI時のみ';
     frameMsText = `${l.mainThreadAvgFrameMs.toFixed(1)} ms`;

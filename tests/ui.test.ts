@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LlmRuntimeClient } from '../src/engine/runtimeClient.ts';
 import { MODEL_CATALOG, getModelById, resolveEffectiveDtype } from '../src/models/catalog.ts';
@@ -984,6 +985,7 @@ describe('StudioDialogHost (native <dialog> compliance)', () => {
     expect(dialog.open).toBe(true);
     expect(dialog.getAttribute('role')).toBeNull();
     expect(dialog.getAttribute('aria-modal')).toBeNull();
+    expect(dialog.getAttribute('closedby')).toBe('any');
     expect(dialog.getAttribute('aria-labelledby')).toBe('studio-confirm-dialog-title');
 
     const cancelBtn = dialog.querySelector('.dialog-footer button[data-dialog-action="cancel"]')!;
@@ -995,6 +997,47 @@ describe('StudioDialogHost (native <dialog> compliance)', () => {
     expect(await confirmPromise).toBe(true);
     expect(dialog.returnValue).toBe('');
     expect(container.querySelector('dialog')).toBeNull();
+  });
+
+  it('supports light-dismiss on backdrop click without dismissing when clicking dialog content', async () => {
+    const container = fakeDoc.createElement('div');
+    fakeDoc.body.appendChild(container);
+    const host = new StudioDialogHost(container as unknown as HTMLElement);
+
+    const confirmPromise = host.showConfirmDialog({
+      title: '履歴削除',
+      message: '削除しますか？',
+    });
+
+    const dialog = container.querySelector('dialog.studio-dialog')!;
+    const bodyEl = dialog.querySelector('.dialog-body')!;
+    bodyEl.click();
+    expect(dialog.open).toBe(true);
+    expect(container.querySelector('dialog')).not.toBeNull();
+
+    // Direct click on <dialog> element simulates ::backdrop click
+    dialog.dispatchEvent(new FakeEvent('click', { bubbles: true, cancelable: true }));
+    expect(await confirmPromise).toBe(false);
+    expect(dialog.returnValue).toBe('');
+    expect(container.querySelector('dialog')).toBeNull();
+  });
+});
+
+describe('HTML & CSS layout/theme compliance', () => {
+  it('includes inline SVG favicon, color-scheme meta, bounded desktop panels, and non-flashing model cards', () => {
+    const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+    expect(html).toContain('<meta name="color-scheme" content="light dark" />');
+    expect(html).toMatch(/<link[^>]*rel="icon"/);
+    expect(html).toContain('type="image/svg+xml"');
+    expect(html).toContain('data:image/svg+xml,');
+
+    const css = readFileSync(new URL('../src/styles/main.css', import.meta.url), 'utf8');
+    expect(css).toMatch(/\.model-card\s*\{[^}]*transition:\s*border-color\s+140ms\s+ease;/s);
+    expect(css).not.toMatch(/\.model-card\s*\{[^}]*transition:[^;]*background-color/s);
+    expect(css).toMatch(/\.workspace-panel\s*\{[^}]*overflow-y:\s*auto;/s);
+    expect(css).toMatch(/\.chat-card\s*\{[^}]*minmax\(110px,\s*1fr\)/s);
+    expect(css).toMatch(/\.hud-metrics-grid\s+dd\s*\{[^}]*white-space:\s*nowrap;/s);
+    expect(css).toMatch(/\.hud-hero-unit\s*\{[^}]*white-space:\s*nowrap;/s);
   });
 });
 
