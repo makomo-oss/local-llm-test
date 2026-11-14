@@ -67,6 +67,7 @@ import {
 
 export type ThemeMode = 'system' | 'dark' | 'light';
 export type WorkspaceTab = 'chat' | 'compare';
+export type MobileWorkspaceView = 'setup' | 'chat' | 'compare';
 
 const THEME_STORAGE_KEY = 'local-llm-test:theme';
 const ACTIVE_LOAD_RECOVERY_KEY = 'local-llm-test:active-load';
@@ -282,6 +283,8 @@ export class AppController {
   // Core UI state
   private themeMode: ThemeMode = 'system';
   private activeTab: WorkspaceTab = 'chat';
+  private mobileView: MobileWorkspaceView = 'setup';
+  private mobileTelemetryExpanded = false;
   private devices: DeviceOption[] = [];
   private selectedDeviceId = '';
   private selectedModelId: ModelId = 'qwen-3.5-0.8b';
@@ -512,7 +515,7 @@ export class AppController {
     ).join('');
 
     this.root.innerHTML = `
-      <div class="studio-shell">
+      <div class="studio-shell" data-mobile-view="${this.mobileView}">
         <div id="studio-live-polite" class="sr-only" aria-live="polite" aria-atomic="true"></div>
         <div id="studio-live-assertive" class="sr-only" aria-live="assertive" aria-atomic="true"></div>
 
@@ -601,6 +604,7 @@ export class AppController {
                 <button type="button" class="btn btn--primary" id="btn-load-model">モデルをロード / ダウンロード</button>
                 <button type="button" class="btn" id="btn-unload-model" disabled>モデル解放 (Unload)</button>
               </div>
+              <button type="button" class="btn btn--primary mobile-only-cta" id="btn-mobile-goto-chat" hidden>チャット・計測画面へ進む →</button>
 
               <div id="load-progress-slot"></div>
 
@@ -693,7 +697,28 @@ export class AppController {
             </nav>
 
             <section id="panel-chat" class="workspace-panel" role="tabpanel" aria-labelledby="tab-chat">
-              <div id="telemetry-hud" class="telemetry-hud" aria-label="リアルタイム推論テレメトリー"></div>
+              <div id="telemetry-mobile-bar" class="telemetry-mobile-bar">
+                <div id="telemetry-mobile-summary" class="telemetry-mobile-summary" aria-label="ライブ計測サマリー">
+                  <span class="telemetry-mini-metric"><span class="telemetry-mini-label">⚡ 速度</span><strong id="mini-metric-speed">- tok/s</strong></span>
+                  <span class="telemetry-mini-metric"><span class="telemetry-mini-label">🧠 メモリ</span><strong id="mini-metric-load">-</strong></span>
+                  <span class="telemetry-mini-metric"><span class="telemetry-mini-label">🔋 電力</span><strong id="mini-metric-power">- W</strong></span>
+                </div>
+                <button
+                  type="button"
+                  id="btn-toggle-telemetry-mobile"
+                  class="btn btn--sm telemetry-mobile-toggle"
+                  aria-expanded="false"
+                  aria-controls="telemetry-hud"
+                >
+                  計測詳細 ▼
+                </button>
+              </div>
+              <div
+                id="telemetry-hud"
+                class="telemetry-hud"
+                data-mobile-expanded="false"
+                aria-label="リアルタイム推論テレメトリー"
+              ></div>
 
               <div class="chat-card">
                 <div id="chat-messages" class="chat-messages" aria-label="チャット履歴"></div>
@@ -705,7 +730,7 @@ export class AppController {
                       id="chat-prompt-input"
                       class="composer-textarea"
                       rows="2"
-                      placeholder="質問やベンチマーク用プロンプトを入力... (Enter で送信 / Shift+Enter で改行 / IME変換中は誤送信しません)"
+                      placeholder="プロンプトを入力... (Enterで送信 / Shift+Enterで改行 / IME安全)"
                     ></textarea>
                   </div>
                   <div class="composer-footer">
@@ -715,7 +740,7 @@ export class AppController {
                         <span>完了時に比較ベンチへ自動記録</span>
                       </label>
                     </div>
-                    <div class="btn-group">
+                    <div class="btn-group composer-actions">
                       <button type="button" class="btn btn--sm" id="btn-clear-chat">会話クリア</button>
                       <button type="button" class="btn" id="btn-run-benchmark">ベンチマーク実行 (1クリック計測)</button>
                       <button type="button" class="btn btn--danger" id="btn-stop-generation" disabled>停止</button>
@@ -731,6 +756,38 @@ export class AppController {
             </section>
           </main>
         </div>
+
+        <nav class="mobile-bottom-nav" aria-label="モバイルワークスペース切替">
+          <button
+            type="button"
+            class="mobile-nav-btn"
+            data-mobile-view-target="setup"
+            aria-pressed="true"
+          >
+            <span class="mobile-nav-icon" aria-hidden="true">⚙</span>
+            <span class="mobile-nav-label">設定</span>
+            <span id="mobile-nav-model-dot" class="mobile-nav-badge">未</span>
+          </button>
+          <button
+            type="button"
+            class="mobile-nav-btn"
+            data-mobile-view-target="chat"
+            aria-pressed="false"
+          >
+            <span class="mobile-nav-icon" aria-hidden="true">💬</span>
+            <span class="mobile-nav-label">チャット</span>
+          </button>
+          <button
+            type="button"
+            class="mobile-nav-btn"
+            data-mobile-view-target="compare"
+            aria-pressed="false"
+          >
+            <span class="mobile-nav-icon" aria-hidden="true">📊</span>
+            <span class="mobile-nav-label">比較</span>
+            <span id="mobile-compare-badge" class="mobile-nav-badge">0</span>
+          </button>
+        </nav>
       </div>
     `;
 
@@ -881,6 +938,27 @@ export class AppController {
 
       if (target.closest('button[data-clear-benchmarks]')) {
         void this.handleClearAllBenchmarks();
+        return;
+      }
+
+      if (target.closest('#btn-mobile-goto-chat')) {
+        this.switchTab('chat');
+        return;
+      }
+
+      const mobileNavBtn = target.closest<HTMLButtonElement>('button[data-mobile-view-target]');
+      if (mobileNavBtn?.dataset.mobileViewTarget) {
+        const nextView = mobileNavBtn.dataset.mobileViewTarget as MobileWorkspaceView;
+        if (nextView === 'setup') {
+          this.setMobileView('setup');
+        } else {
+          this.switchTab(nextView === 'compare' ? 'compare' : 'chat');
+        }
+        return;
+      }
+
+      if (target.closest('#btn-toggle-telemetry-mobile')) {
+        this.toggleMobileTelemetry();
         return;
       }
 
@@ -1044,8 +1122,43 @@ export class AppController {
       comparePanel.hidden = isChat;
     }
 
+    this.setMobileView(isChat ? 'chat' : 'compare');
+
     if (focusTab) {
       (isChat ? chatTab : compareTab)?.focus();
+    }
+  }
+
+  private setMobileView(view: MobileWorkspaceView): void {
+    const changed = this.mobileView !== view;
+    this.mobileView = view;
+    const shell = this.root.querySelector<HTMLElement>('.studio-shell');
+    if (shell) {
+      shell.dataset.mobileView = view;
+    }
+    const navBtns = this.root.querySelectorAll<HTMLButtonElement>('button[data-mobile-view-target]');
+    navBtns.forEach((btn) => {
+      btn.setAttribute('aria-pressed', btn.dataset.mobileViewTarget === view ? 'true' : 'false');
+    });
+    if (changed && typeof window !== 'undefined' && typeof window.scrollTo === 'function') {
+      try {
+        window.scrollTo({ top: 0, behavior: 'auto' });
+      } catch {
+        // Ignore in environments where scrollTo options fail.
+      }
+    }
+  }
+
+  private toggleMobileTelemetry(): void {
+    this.mobileTelemetryExpanded = !this.mobileTelemetryExpanded;
+    const hud = this.root.querySelector<HTMLElement>('#telemetry-hud');
+    if (hud) {
+      hud.dataset.mobileExpanded = this.mobileTelemetryExpanded ? 'true' : 'false';
+    }
+    const btn = this.root.querySelector<HTMLButtonElement>('#btn-toggle-telemetry-mobile');
+    if (btn) {
+      btn.setAttribute('aria-expanded', this.mobileTelemetryExpanded ? 'true' : 'false');
+      btn.textContent = this.mobileTelemetryExpanded ? '計測詳細 ▲' : '計測詳細 ▼';
     }
   }
 
@@ -1223,6 +1336,25 @@ export class AppController {
       }
     }
 
+    const mobileDot = this.root.querySelector<HTMLElement>('#mobile-nav-model-dot');
+    if (mobileDot) {
+      if (this.isLoadingModel) {
+        mobileDot.className = 'mobile-nav-badge mobile-nav-badge--accent';
+        mobileDot.textContent = '中';
+      } else if (this.loadedState) {
+        mobileDot.className = 'mobile-nav-badge mobile-nav-badge--ready';
+        mobileDot.textContent = '済';
+      } else {
+        mobileDot.className = 'mobile-nav-badge';
+        mobileDot.textContent = '未';
+      }
+    }
+
+    const mobileGoChatBtn = this.root.querySelector<HTMLButtonElement>('#btn-mobile-goto-chat');
+    if (mobileGoChatBtn) {
+      mobileGoChatBtn.hidden = !hasLoaded;
+    }
+
     if (activeSummary) {
       if (this.activeGen) {
         activeSummary.textContent = `推論実行中: ${getModelById(this.activeGen.modelId).name} (${this.activeGen.tokenCount} tokens)`;
@@ -1322,14 +1454,51 @@ export class AppController {
 
   private renderTelemetryHud(): void {
     const hud = this.root.querySelector<HTMLElement>('#telemetry-hud');
-    if (!hud) return;
-    hud.innerHTML = renderTelemetryHudHtml({
-      liveSnapshot: this.activeGen?.liveSnapshot ?? null,
-      finalMetrics: this.lastCompletedMetrics,
-      liveBattery: this.liveBattery,
-      isGenerating: Boolean(this.activeGen),
-      selectedDevice: this.loadedState?.device ?? this.getSelectedDevice(),
-    });
+    const liveSnapshot = this.activeGen?.liveSnapshot ?? null;
+    const finalMetrics = this.lastCompletedMetrics;
+    const isGenerating = Boolean(this.activeGen);
+
+    if (hud) {
+      hud.innerHTML = renderTelemetryHudHtml({
+        liveSnapshot,
+        finalMetrics,
+        liveBattery: this.liveBattery,
+        isGenerating,
+        selectedDevice: this.loadedState?.device ?? this.getSelectedDevice(),
+      });
+    }
+
+    const speedEl = this.root.querySelector<HTMLElement>('#mini-metric-speed');
+    const loadEl = this.root.querySelector<HTMLElement>('#mini-metric-load');
+    const powerEl = this.root.querySelector<HTMLElement>('#mini-metric-power');
+    if (speedEl) {
+      const val =
+        isGenerating && liveSnapshot
+          ? liveSnapshot.speed.decodeTokensPerSec > 0
+            ? liveSnapshot.speed.decodeTokensPerSec.toFixed(1)
+            : '0.0'
+          : finalMetrics
+            ? (finalMetrics.speed.decodeTokensPerSec > 0
+                ? finalMetrics.speed.decodeTokensPerSec
+                : finalMetrics.speed.tokensPerSec
+              ).toFixed(1)
+            : '-';
+      speedEl.textContent = `${val} tok/s`;
+    }
+    if (loadEl) {
+      const bytes =
+        isGenerating && liveSnapshot
+          ? liveSnapshot.estimatedVramBytes
+          : finalMetrics?.load.estimatedVramBytes;
+      loadEl.textContent = bytes !== undefined ? formatBytes(bytes) : '-';
+    }
+    if (powerEl) {
+      const watts =
+        isGenerating && liveSnapshot
+          ? liveSnapshot.power?.estimatedPowerWatts
+          : finalMetrics?.power.estimatedPowerWatts;
+      powerEl.textContent = watts !== undefined ? `${watts.toFixed(1)} W` : '-';
+    }
   }
 
   private renderChatMessages(): void {
@@ -1355,6 +1524,10 @@ export class AppController {
     const badge = this.root.querySelector<HTMLElement>('#benchmark-count-badge');
     if (badge) {
       badge.textContent = String(records.length);
+    }
+    const mobileBadge = this.root.querySelector<HTMLElement>('#mobile-compare-badge');
+    if (mobileBadge) {
+      mobileBadge.textContent = String(records.length);
     }
 
     const container = this.root.querySelector<HTMLElement>('#comparison-container');
@@ -1654,6 +1827,10 @@ export class AppController {
     const preset = getPresetById(this.selectedPresetId);
     if (!preset) return;
 
+    if (focusInput) {
+      this.switchTab('chat');
+    }
+
     const textarea = this.root.querySelector<HTMLTextAreaElement>('#chat-prompt-input');
     if (textarea) {
       textarea.value = preset.prompt;
@@ -1700,9 +1877,10 @@ export class AppController {
     if (!this.loadedState) {
       this.statusBanner = {
         kind: 'warn',
-        text: 'モデルが未ロードです。左パネルの「モデルをロード / ダウンロード」を先に実行してください。',
+        text: 'モデルが未ロードです。設定パネルの「モデルをロード / ダウンロード」を先に実行してください。',
       };
       this.syncActionButtons();
+      this.setMobileView('setup');
       this.announcer?.announceAssertive(this.statusBanner.text);
       this.root.querySelector<HTMLButtonElement>('#btn-load-model')?.focus();
       return;
@@ -1736,9 +1914,10 @@ export class AppController {
     if (!this.loadedState) {
       this.statusBanner = {
         kind: 'warn',
-        text: 'モデルが未ロードです。左パネルでモデルをロードしてからベンチマークを実行してください。',
+        text: 'モデルが未ロードです。設定パネルでモデルをロードしてからベンチマークを実行してください。',
       };
       this.syncActionButtons();
+      this.setMobileView('setup');
       this.announcer?.announceAssertive(this.statusBanner.text);
       this.root.querySelector<HTMLButtonElement>('#btn-load-model')?.focus();
       return;

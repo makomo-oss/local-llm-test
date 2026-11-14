@@ -424,7 +424,7 @@ export function renderEmptyGuideHtml(presets: readonly BenchmarkPromptPreset[]):
     <div class="empty-guide">
       <h2>完全ブラウザ完結型 ローカル LLM 推論スタジオへようこそ</h2>
       <ol class="guide-steps">
-        <li>左パネルで <strong>モデル (6種類)</strong> と <strong>実行デバイス (WebGPU GPU / CPU WASM)</strong> を選択します。</li>
+        <li>設定パネル（PCは左欄・スマホは下部「⚙ 設定」タブ）で <strong>モデル (6種類)</strong> と <strong>実行デバイス (WebGPU GPU / CPU WASM)</strong> を選択します。</li>
         <li><strong>「モデルをロード / ダウンロード」</strong> をクリックしてブラウザへ展開します（初回後はキャッシュから高速ロード）。</li>
         <li>下の入力欄から対話するか、<strong>「ベンチマーク実行 (1クリック計測)」</strong> で速度・負荷・電力効率を比較できます。</li>
       </ol>
@@ -538,7 +538,7 @@ export function renderComparisonViewHtml(input: {
 
   const rowsHtml =
     records.length === 0
-      ? `<tr><td colspan="12">まだベンチマーク記録がありません。</td></tr>`
+      ? `<tr><td colspan="12" class="table-empty-cell">まだベンチマーク記録がありません。</td></tr>`
       : records
           .map((r) => {
             const { speed, load, power } = r.metrics;

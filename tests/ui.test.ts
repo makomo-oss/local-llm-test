@@ -1473,4 +1473,118 @@ describe('DebouncedLiveAnnouncer & AppController integration', () => {
 
     controller.dispose();
   });
+
+  it('supports mobile bottom navigation, compact telemetry toggle, and auto-navigation cues', async () => {
+    const doc = new FakeDocument();
+    vi.stubGlobal('document', doc);
+
+    const root = doc.createElement('div');
+    doc.body.appendChild(root);
+
+    const sampleMetrics = makeSampleMetrics();
+    const mockClient = {
+      probeDevices: vi.fn(async () => [GPU_DEVICE_F16, CPU_WASM_DEVICE]),
+      loadModel: vi.fn(async () => ({
+        modelId: 'qwen-3.5-0.8b' as const,
+        device: GPU_DEVICE_F16,
+        effectiveDtype: 'q4f16' as const,
+        useExternalDataFormat: false,
+        loadTimeMs: 120,
+      })),
+      generate: vi.fn(async () => ({
+        fullText: '応答OK',
+        thinking: '',
+        content: '応答OK',
+        aborted: false,
+        speed: sampleMetrics.speed,
+        activeThreads: 2,
+        backend: 'webgpu' as const,
+        dtype: 'q4f16' as const,
+      })),
+      abort: vi.fn(),
+      unloadModel: vi.fn(async () => undefined),
+      inspectCache: vi.fn(async () => []),
+      clearCache: vi.fn(),
+      dispose: vi.fn(),
+    } as unknown as LlmRuntimeClient;
+
+    const controller = new AppController(root as unknown as HTMLElement, {
+      client: mockClient,
+      benchmarkStore: new BenchmarkStore({ storage: null }),
+      themeStorage: createMemoryStorage(),
+      sessionStorage: createMemoryStorage(),
+      getStorageEstimateFn: async () => ({}),
+      sampleBatteryFn: async () => ({ supported: true, level: 88, charging: false, sampledAt: 1 }),
+      observeBatteryFn: async () => () => {},
+      telemetryEnv: { requestAnimationFrame: null, PerformanceObserver: null },
+    });
+
+    await controller.init();
+
+    const shell = root.querySelector('.studio-shell')!;
+    const navSetup = root.querySelector('button[data-mobile-view-target="setup"]')!;
+    const navChat = root.querySelector('button[data-mobile-view-target="chat"]')!;
+    const navCompare = root.querySelector('button[data-mobile-view-target="compare"]')!;
+    const goChatBtn = root.querySelector('#btn-mobile-goto-chat')!;
+    const modelDot = root.querySelector('#mobile-nav-model-dot')!;
+    const toggleTelemetryBtn = root.querySelector('#btn-toggle-telemetry-mobile')!;
+    const hud = root.querySelector('#telemetry-hud')!;
+
+    // Initial state starts on mobile setup view with model unloaded
+    expect(shell.dataset.mobileView).toBe('setup');
+    expect(navSetup.getAttribute('aria-pressed')).toBe('true');
+    expect(goChatBtn.hidden).toBe(true);
+    expect(modelDot.textContent).toBe('未');
+    expect(hud.dataset.mobileExpanded).toBe('false');
+    expect(toggleTelemetryBtn.getAttribute('aria-expanded')).toBe('false');
+
+    // Bottom nav switches to compare & chat cleanly
+    navCompare.click();
+    expect(shell.dataset.mobileView).toBe('compare');
+    expect(navCompare.getAttribute('aria-pressed')).toBe('true');
+    expect(root.querySelector('#panel-compare')!.hidden).toBe(false);
+
+    navChat.click();
+    expect(shell.dataset.mobileView).toBe('chat');
+    expect(navChat.getAttribute('aria-pressed')).toBe('true');
+    expect(root.querySelector('#panel-chat')!.hidden).toBe(false);
+
+    // Submitting chat while unloaded returns mobile view to setup and shows warning
+    root.querySelector('#chat-composer-form')!.requestSubmit();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(shell.dataset.mobileView).toBe('setup');
+    expect(root.querySelector('#runtime-status-banner')!.hidden).toBe(false);
+
+    // Loading model marks mobile badge ready & shows quick-jump CTA
+    await controller.handleLoadModel();
+    expect(modelDot.textContent).toBe('済');
+    expect(goChatBtn.hidden).toBe(false);
+
+    goChatBtn.click();
+    expect(shell.dataset.mobileView).toBe('chat');
+
+    // Compact telemetry toggle updates ARIA and expanded attribute
+    toggleTelemetryBtn.click();
+    expect(hud.dataset.mobileExpanded).toBe('true');
+    expect(toggleTelemetryBtn.getAttribute('aria-expanded')).toBe('true');
+    toggleTelemetryBtn.click();
+    expect(hud.dataset.mobileExpanded).toBe('false');
+
+    // Applying preset from setup switches cleanly to chat view
+    navSetup.click();
+    expect(shell.dataset.mobileView).toBe('setup');
+    root.querySelector('#btn-apply-preset')!.click();
+    expect(shell.dataset.mobileView).toBe('chat');
+    expect(root.querySelector('#chat-prompt-input')!.value.length).toBeGreaterThan(0);
+
+    // Running generation populates compact mobile metrics & benchmark badge
+    root.querySelector('#chat-composer-form')!.requestSubmit();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(root.querySelector('#mini-metric-speed')!.textContent).toContain('tok/s');
+    expect(root.querySelector('#mini-metric-speed')!.textContent).not.toBe('- tok/s');
+    expect(root.querySelector('#mini-metric-power')!.textContent).toContain('W');
+    expect(root.querySelector('#mobile-compare-badge')!.textContent).toBe('1');
+
+    controller.dispose();
+  });
 });
