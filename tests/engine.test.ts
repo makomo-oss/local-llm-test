@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ModelRegistry } from '@huggingface/transformers';
 import {
   TRANSFORMERS_CACHE_NAME,
   clearModelCache,
@@ -8,10 +9,22 @@ import {
   measureCachedResponseBytes,
 } from '../src/engine/cacheManager.ts';
 import {
+  classifyModelLoadError,
   computeSpeedMetrics,
   createDownloadProgressAggregator,
   stripTrailingSpecialDelimiters,
 } from '../src/engine/llm.worker.ts';
+import {
+  buildPrecachedResponseHeaders,
+  buildRemoteModelFileUrl,
+  createSerializedCacheAdapter,
+  filterCausalLmModelFiles,
+  isOptionalModelFile,
+  precacheModelFilesSequentially,
+  probeStreamingCachePutSupport,
+  resolveExpectedContentLength,
+  resolveExternalDataAugmentedConfig,
+} from '../src/engine/modelPrecacher.ts';
 import {
   LlmRuntimeClient,
   LlmRuntimeError,
@@ -787,5 +800,385 @@ describe('LlmRuntimeClient', () => {
     expect(workers[1]!.terminated).toBe(true);
     expect(workers[1]!.listenerCount()).toBe(0);
     await expect(client.probeDevices()).rejects.toMatchObject({ code: 'CLIENT_DISPOSED' });
+  });
+});
+
+describe('modelPrecacher & low-memory worker safeguards', () => {
+  it('constructs exact Hugging Face resolve URLs and sanitizes streamed response headers', () => {
+    expect(
+      buildRemoteModelFileUrl(
+        'onnx-community/Qwen3.5-0.8B-ONNX',
+        '/onnx/decoder_model_merged_q4f16.onnx_data'
+      )
+    ).toBe(
+      'https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX/resolve/main/onnx/decoder_model_merged_q4f16.onnx_data'
+    );
+
+    const compressedHeaders = new Headers({
+      'content-encoding': 'br',
+      'content-length': '120',
+      'content-type': 'application/json',
+      etag: '"abc"',
+    });
+    expect(resolveExpectedContentLength(compressedHeaders)).toBeUndefined();
+    const cleaned = buildPrecachedResponseHeaders(compressedHeaders);
+    expect(cleaned.get('content-encoding')).toBeNull();
+    expect(cleaned.get('content-length')).toBeNull();
+    expect(cleaned.get('content-type')).toBe('application/json');
+
+    const lfsHeaders = new Headers({
+      'x-linked-size': '584705674',
+      'content-type': 'application/octet-stream',
+    });
+    expect(resolveExpectedContentLength(lfsHeaders)).toBe(584_705_674);
+    const preserved = buildPrecachedResponseHeaders(lfsHeaders);
+    expect(preserved.get('content-length')).toBe('584705674');
+
+    expect(isOptionalModelFile('generation_config.json')).toBe(true);
+    expect(isOptionalModelFile('config.json')).toBe(false);
+    expect(isOptionalModelFile('onnx/model_q4.onnx')).toBe(false);
+  });
+
+  it('augments config with use_external_data_format without mutating source and discovers ONNX + external data via ModelRegistry', async () => {
+    const baseLlamaConfig: Record<string, unknown> = {
+      model_type: 'llama',
+      'transformers.js_config': {
+        use_external_data_format: { 'model_q4f16.onnx': 1 },
+      },
+    };
+    const augmented = resolveExternalDataAugmentedConfig(baseLlamaConfig, true);
+    expect(
+      (baseLlamaConfig['transformers.js_config'] as Record<string, unknown>).use_external_data_format
+    ).toEqual({ 'model_q4f16.onnx': 1 });
+    expect(
+      (augmented['transformers.js_config'] as Record<string, unknown>).use_external_data_format
+    ).toBe(true);
+
+    const qwenConfig = {
+      architectures: ['Qwen3_5ForConditionalGeneration'],
+      model_type: 'qwen3_5',
+      'transformers.js_config': {
+        use_external_data_format: true,
+      },
+    };
+    const qwenRawFiles = await ModelRegistry.get_model_files('onnx-community/Qwen3.5-0.8B-ONNX', {
+      config: qwenConfig as never,
+      dtype: 'q4f16',
+      device: 'webgpu',
+    });
+    const qwenFiles = filterCausalLmModelFiles(qwenRawFiles, 'Qwen3_5ForConditionalGeneration');
+    expect(qwenFiles).toContain('onnx/embed_tokens_q4f16.onnx');
+    expect(qwenFiles).toContain('onnx/embed_tokens_q4f16.onnx_data');
+    expect(qwenFiles).toContain('onnx/decoder_model_merged_q4f16.onnx');
+    expect(qwenFiles).toContain('onnx/decoder_model_merged_q4f16.onnx_data');
+    expect(qwenFiles.some((f) => f.includes('vision_encoder'))).toBe(false);
+
+    const gemmaConfig = {
+      architectures: ['Gemma4ForConditionalGeneration'],
+      model_type: 'gemma4',
+      text_config: {
+        model_type: 'gemma4_text',
+      },
+      'transformers.js_config': {
+        use_external_data_format: true,
+      },
+    };
+    const gemmaRawFiles = await ModelRegistry.get_model_files(
+      'onnx-community/gemma-4-E2B-it-ONNX',
+      {
+        config: gemmaConfig as never,
+        dtype: 'q4f16',
+        device: 'webgpu',
+      }
+    );
+    const gemmaFiles = filterCausalLmModelFiles(gemmaRawFiles, 'Gemma4ForConditionalGeneration');
+    expect(gemmaFiles).toContain('onnx/embed_tokens_q4f16.onnx');
+    expect(gemmaFiles).toContain('onnx/decoder_model_merged_q4f16.onnx');
+    expect(gemmaFiles.some((f) => f.includes('vision_encoder') || f.includes('audio_encoder'))).toBe(
+      false
+    );
+
+    const llamaQ8Files = await ModelRegistry.get_model_files(
+      'onnx-community/Llama-3.2-3B-Instruct-ONNX',
+      {
+        config: augmented as never,
+        dtype: 'q8',
+        device: 'webgpu',
+      }
+    );
+    expect(llamaQ8Files).toContain('onnx/model_quantized.onnx');
+    expect(llamaQ8Files).toContain('onnx/model_quantized.onnx_data');
+  });
+
+  it('downloads files strictly one-by-one into CacheStorage via stream, skips valid cached entries, and handles 404/aborts/empty binaries', async () => {
+    const timeline: string[] = [];
+    const stored = new Map<string, { bytes: number; headers: Headers }>();
+
+    const cachedEmbedUrl = buildRemoteModelFileUrl(
+      'onnx-community/Qwen3.5-0.8B-ONNX',
+      'onnx/embed_tokens_q4f16.onnx_data'
+    );
+    const corruptEmptyDecoderUrl = buildRemoteModelFileUrl(
+      'onnx-community/Qwen3.5-0.8B-ONNX',
+      'onnx/decoder_model_merged_q4f16.onnx_data'
+    );
+
+    stored.set(cachedEmbedUrl, {
+      bytes: 1234,
+      headers: new Headers({ 'content-length': '1234' }),
+    });
+    // Simulate a corrupt 0-byte WebKit cache entry from a previous failed attempt
+    stored.set(corruptEmptyDecoderUrl, {
+      bytes: 0,
+      headers: new Headers({ 'content-length': '0' }),
+    });
+
+    const mockCache: Cache = {
+      match: vi.fn(async (req: RequestInfo | URL) => {
+        const key = typeof req === 'string' ? req : req instanceof URL ? req.href : req.url;
+        const entry = stored.get(key);
+        if (!entry) return undefined;
+        return new Response(new Uint8Array(entry.bytes), { status: 200, headers: entry.headers });
+      }),
+      put: vi.fn(async (req: RequestInfo | URL, response: Response) => {
+        const key = typeof req === 'string' ? req : req instanceof URL ? req.href : req.url;
+        const buf = await response.arrayBuffer();
+        timeline.push(`put:${key.split('/').pop()}`);
+        stored.set(key, { bytes: buf.byteLength, headers: new Headers(response.headers) });
+      }),
+      delete: vi.fn(async () => true),
+      keys: vi.fn(async () => []),
+      add: vi.fn(),
+      addAll: vi.fn(),
+      matchAll: vi.fn(),
+    } as unknown as Cache;
+
+    const mockStorage = {
+      open: vi.fn(async () => mockCache),
+    } as unknown as CacheStorage;
+
+    const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const name = url.split('/').pop()!;
+      timeline.push(`fetch:${name}`);
+
+      if (name === 'generation_config.json') {
+        return new Response(null, { status: 404, statusText: 'Not Found' });
+      }
+
+      const chunks =
+        name === 'decoder_model_merged_q4f16.onnx_data'
+          ? [new Uint8Array(64).fill(1), new Uint8Array(64).fill(2)]
+          : [new Uint8Array(32).fill(3)];
+      const total = chunks.reduce((s, c) => s + c.byteLength, 0);
+
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) {
+            controller.enqueue(chunk);
+          }
+          controller.close();
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-length': String(total), 'content-type': 'application/octet-stream' },
+      });
+    }) as unknown as typeof fetch;
+
+    const progressEvents: string[] = [];
+    const result = await precacheModelFilesSequentially({
+      repoId: 'onnx-community/Qwen3.5-0.8B-ONNX',
+      files: [
+        'onnx/embed_tokens_q4f16.onnx',
+        'onnx/embed_tokens_q4f16.onnx_data',
+        'onnx/decoder_model_merged_q4f16.onnx_data',
+        'generation_config.json',
+      ],
+      cacheStorage: mockStorage,
+      fetchFn,
+      supportsStreamingPut: true,
+      minEmitIntervalMs: 0,
+      onFileProgress: (ev) => {
+        progressEvents.push(`${ev.file}:${ev.status}:${ev.loaded ?? 0}/${ev.total ?? 0}`);
+      },
+    });
+
+    expect(result).toEqual({
+      usedBrowserCache: true,
+      totalFiles: 4,
+      downloadedFiles: 2,
+      skippedCachedFiles: 1,
+      downloadedBytes: 32 + 128,
+    });
+
+    // Strict sequential guarantee: file 1 finishes cache.put BEFORE file 2 starts fetching!
+    expect(timeline).toEqual([
+      'fetch:embed_tokens_q4f16.onnx',
+      'put:embed_tokens_q4f16.onnx',
+      'fetch:decoder_model_merged_q4f16.onnx_data',
+      'put:decoder_model_merged_q4f16.onnx_data',
+      'fetch:generation_config.json',
+    ]);
+    expect(stored.get(corruptEmptyDecoderUrl)?.bytes).toBe(128);
+    expect(progressEvents).toContain('onnx/embed_tokens_q4f16.onnx_data:done:1234/1234');
+    expect(progressEvents).toContain('onnx/decoder_model_merged_q4f16.onnx_data:done:128/128');
+
+    // Required missing binary must throw loudly
+    const failFetch = vi.fn(
+      async () => new Response(null, { status: 404, statusText: 'Not Found' })
+    ) as unknown as typeof fetch;
+    await expect(
+      precacheModelFilesSequentially({
+        repoId: 'onnx-community/Qwen3.5-0.8B-ONNX',
+        files: ['onnx/missing_required.onnx'],
+        cacheStorage: mockStorage,
+        fetchFn: failFetch,
+        supportsStreamingPut: true,
+      })
+    ).rejects.toThrow('onnx/missing_required.onnx');
+  });
+
+  it('spools via OPFS sync access handle when WebKit fails stream-backed Cache.put, cleans temp OPFS file, and maps QuotaExceededError', async () => {
+    const webkitBrokenCache: Cache = {
+      match: vi.fn(async () => new Response(new Uint8Array(0), { status: 200 })),
+      put: vi.fn(async () => undefined),
+      delete: vi.fn(async () => true),
+    } as unknown as Cache;
+    expect(await probeStreamingCachePutSupport(webkitBrokenCache)).toBe(false);
+
+    const writtenChunks: number[] = [];
+    const removeEntrySpy = vi.fn(async () => undefined);
+    const closeSpy = vi.fn();
+    const mockOpfs = {
+      getFileHandle: vi.fn(async () => ({
+        createSyncAccessHandle: vi.fn(async () => ({
+          write: (buf: BufferSource) => {
+            writtenChunks.push((buf as Uint8Array).byteLength);
+            return (buf as Uint8Array).byteLength;
+          },
+          flush: vi.fn(),
+          close: closeSpy,
+        })),
+        getFile: vi.fn(async () => new Blob([new Uint8Array(256).fill(7)])),
+      })),
+      removeEntry: removeEntrySpy,
+    };
+
+    const storedBodies = new Map<string, number>();
+    const backingCache: Cache = {
+      match: vi.fn(async (req: RequestInfo | URL) => {
+        const key = String(req);
+        if (key.includes('__stream_cache_probe__')) {
+          return new Response(new Uint8Array(0), { status: 200 });
+        }
+        return undefined;
+      }),
+      put: vi.fn(async (req: RequestInfo | URL, res: Response) => {
+        const key = String(req);
+        if (key.includes('__stream_cache_probe__')) return;
+        const ab = await res.arrayBuffer();
+        storedBodies.set(key, ab.byteLength);
+      }),
+      delete: vi.fn(async () => true),
+    } as unknown as Cache;
+
+    const storage = { open: vi.fn(async () => backingCache) } as unknown as CacheStorage;
+    const fetchFn = vi.fn(async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(128).fill(7));
+          controller.enqueue(new Uint8Array(128).fill(7));
+          controller.close();
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-length': '256' },
+      });
+    }) as unknown as typeof fetch;
+
+    const res = await precacheModelFilesSequentially({
+      repoId: 'onnx-community/Qwen3.5-0.8B-ONNX',
+      files: ['onnx/embed_tokens_q4f16.onnx_data'],
+      cacheStorage: storage,
+      fetchFn,
+      opfsRoot: mockOpfs,
+      minEmitIntervalMs: 0,
+    });
+    expect(res.downloadedBytes).toBe(256);
+    expect(writtenChunks).toEqual([128, 128]);
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    expect(removeEntrySpy).toHaveBeenCalledTimes(1);
+    expect(
+      storedBodies.get(
+        buildRemoteModelFileUrl(
+          'onnx-community/Qwen3.5-0.8B-ONNX',
+          'onnx/embed_tokens_q4f16.onnx_data'
+        )
+      )
+    ).toBe(256);
+
+    // QuotaExceededError propagates with STORAGE_QUOTA_EXCEEDED
+    const quotaCache: Cache = {
+      match: vi.fn(async () => undefined),
+      put: vi.fn(async () => {
+        const err = new Error('Quota exceeded');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }),
+      delete: vi.fn(async () => true),
+    } as unknown as Cache;
+    await expect(
+      precacheModelFilesSequentially({
+        repoId: 'onnx-community/Qwen3.5-0.8B-ONNX',
+        files: ['onnx/decoder_model_merged_q4f16.onnx_data'],
+        cacheStorage: { open: vi.fn(async () => quotaCache) } as unknown as CacheStorage,
+        fetchFn,
+        supportsStreamingPut: true,
+      })
+    ).rejects.toMatchObject({ code: 'STORAGE_QUOTA_EXCEEDED' });
+  });
+
+  it('serializes concurrent customCache reads via FIFO queue and classifies worker OOM/quota errors', async () => {
+    let activeMatches = 0;
+    let peakConcurrent = 0;
+    const order: string[] = [];
+
+    const slowCache: Cache = {
+      match: vi.fn(async (req: RequestInfo | URL) => {
+        activeMatches += 1;
+        peakConcurrent = Math.max(peakConcurrent, activeMatches);
+        order.push(`start:${String(req)}`);
+        await new Promise((r) => setTimeout(r, 15));
+        order.push(`end:${String(req)}`);
+        activeMatches -= 1;
+        return new Response('ok');
+      }),
+      put: vi.fn(async () => undefined),
+    } as unknown as Cache;
+
+    const adapter = createSerializedCacheAdapter(TRANSFORMERS_CACHE_NAME, {
+      open: vi.fn(async () => slowCache),
+    } as unknown as CacheStorage)!;
+
+    await Promise.all([adapter.match('a.onnx_data'), adapter.match('b.onnx_data')]);
+    expect(peakConcurrent).toBe(1);
+    expect(order).toEqual([
+      'start:a.onnx_data',
+      'end:a.onnx_data',
+      'start:b.onnx_data',
+      'end:b.onnx_data',
+    ]);
+
+    expect(
+      classifyModelLoadError(
+        new Error("Can't create a session. failed to allocate a buffer of size 1200000000.")
+      )
+    ).toMatchObject({ code: 'OUT_OF_MEMORY' });
+
+    const quotaErr = new Error('Quota exceeded');
+    quotaErr.name = 'QuotaExceededError';
+    expect(classifyModelLoadError(quotaErr)).toMatchObject({ code: 'STORAGE_QUOTA_EXCEEDED' });
   });
 });

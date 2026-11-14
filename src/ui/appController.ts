@@ -29,9 +29,12 @@ import {
   getPresetById,
 } from '../telemetry/presets.ts';
 import {
+  assessModelMemoryRisk,
   observeBatteryChanges,
   sampleBatteryStatus,
   type BatterySnapshot,
+  type MemoryRiskAssessment,
+  type MemoryRiskEnvironment,
 } from '../telemetry/systemProbe.ts';
 import type {
   BenchmarkRecord,
@@ -65,6 +68,15 @@ export type ThemeMode = 'system' | 'dark' | 'light';
 export type WorkspaceTab = 'chat' | 'compare';
 
 const THEME_STORAGE_KEY = 'local-llm-test:theme';
+const ACTIVE_LOAD_RECOVERY_KEY = 'local-llm-test:active-load';
+
+interface ActiveLoadRecoveryMarker {
+  modelId: ModelId;
+  modelName: string;
+  dtype: QuantDtype;
+  backend: 'webgpu' | 'wasm';
+  startedAt: number;
+}
 
 /**
  * Centralized debounced `aria-live` announcer so streaming tokens and progress
@@ -163,6 +175,8 @@ export interface AppControllerDeps {
   cancelAnimationFrameFn?: (id: number) => void;
   nowFn?: () => number;
   themeStorage?: StorageLike | null;
+  sessionStorage?: StorageLike | null;
+  memoryRiskEnv?: MemoryRiskEnvironment;
   downloadFileFn?: (filename: string, content: string, mimeType: string) => void;
   copyTextFn?: (text: string) => Promise<void>;
 }
@@ -206,6 +220,18 @@ function resolveDefaultThemeStorage(): StorageLike | undefined {
   return undefined;
 }
 
+function resolveDefaultSessionStorage(): StorageLike | undefined {
+  try {
+    const storage = (globalThis as { sessionStorage?: StorageLike }).sessionStorage;
+    if (storage && typeof storage.getItem === 'function') {
+      return storage;
+    }
+  } catch {
+    // Ignore restricted sessionStorage.
+  }
+  return undefined;
+}
+
 function defaultDownloadFile(filename: string, content: string, mimeType: string): void {
   const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
@@ -243,10 +269,13 @@ export class AppController {
   private readonly deps: AppControllerDeps;
   private readonly dialogHost: StudioDialogHost;
   private readonly themeStorage: StorageLike | undefined;
+  private readonly loadSessionStorage: StorageLike | undefined;
+  private readonly memoryRiskEnv: MemoryRiskEnvironment | undefined;
 
   private announcer: DebouncedLiveAnnouncer | null = null;
   private cleanupImeSubmit: (() => void) | null = null;
   private cleanupBatteryObserver: (() => void) | null = null;
+  private cleanupPageHideListener: (() => void) | null = null;
   private disposed = false;
 
   // Core UI state
@@ -294,6 +323,11 @@ export class AppController {
     this.benchmarkStore = deps.benchmarkStore ?? new BenchmarkStore();
     this.themeStorage =
       deps.themeStorage === null ? undefined : (deps.themeStorage ?? resolveDefaultThemeStorage());
+    this.loadSessionStorage =
+      deps.sessionStorage === null
+        ? undefined
+        : (deps.sessionStorage ?? resolveDefaultSessionStorage());
+    this.memoryRiskEnv = deps.memoryRiskEnv;
     this.dialogHost = new StudioDialogHost(this.root);
 
     this.restoreThemeMode();
@@ -302,6 +336,8 @@ export class AppController {
   async init(): Promise<void> {
     this.renderShell();
     this.bindEvents();
+    this.bindPageLifecycleCleanup();
+    this.consumeInterruptedLoadRecovery();
     this.applyThemeMode(this.themeMode, false);
     this.syncModelControls();
     this.renderChatMessages();
@@ -313,6 +349,10 @@ export class AppController {
       this.refreshCachesAndStorage(),
       this.refreshBattery(),
     ]);
+
+    if (this.disposed) {
+      return;
+    }
 
     const observeFn = this.deps.observeBatteryFn ?? observeBatteryChanges;
     try {
@@ -337,12 +377,74 @@ export class AppController {
     this.cleanupImeSubmit = null;
     this.cleanupBatteryObserver?.();
     this.cleanupBatteryObserver = null;
+    this.cleanupPageHideListener?.();
+    this.cleanupPageHideListener = null;
+    this.clearActiveLoadRecoveryMarker();
     this.announcer?.dispose();
     this.announcer = null;
     this.dialogHost.closeActive();
     if (this.ownsClient) {
       this.client.dispose();
     }
+  }
+
+  private bindPageLifecycleCleanup(): void {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
+    const handleCleanExit = (): void => {
+      this.clearActiveLoadRecoveryMarker();
+    };
+    window.addEventListener('pagehide', handleCleanExit);
+    window.addEventListener('beforeunload', handleCleanExit);
+    this.cleanupPageHideListener = () => {
+      window.removeEventListener('pagehide', handleCleanExit);
+      window.removeEventListener('beforeunload', handleCleanExit);
+    };
+  }
+
+  private saveActiveLoadRecoveryMarker(marker: ActiveLoadRecoveryMarker): void {
+    try {
+      this.loadSessionStorage?.setItem(ACTIVE_LOAD_RECOVERY_KEY, JSON.stringify(marker));
+    } catch {
+      // Ignore restricted storage.
+    }
+  }
+
+  private clearActiveLoadRecoveryMarker(): void {
+    try {
+      this.loadSessionStorage?.removeItem(ACTIVE_LOAD_RECOVERY_KEY);
+    } catch {
+      // Ignore restricted storage.
+    }
+  }
+
+  private consumeInterruptedLoadRecovery(): void {
+    try {
+      const raw = this.loadSessionStorage?.getItem(ACTIVE_LOAD_RECOVERY_KEY);
+      if (!raw) {
+        return;
+      }
+      this.loadSessionStorage?.removeItem(ACTIVE_LOAD_RECOVERY_KEY);
+      const parsed = JSON.parse(raw) as Partial<ActiveLoadRecoveryMarker>;
+      const label =
+        typeof parsed.modelName === 'string' && parsed.modelName.trim()
+          ? parsed.modelName.trim()
+          : 'モデル';
+      this.statusBanner = {
+        kind: 'warn',
+        text: `⚠ 前回の ${label} ロード中にブラウザのメモリ上限などでタブが再起動されました。ダウンロード済みファイルはキャッシュに残っています。スマホ環境では「Qwen 3.5 0.8B (WebGPU)」の使用や他タブの終了をおすすめします。`,
+      };
+    } catch {
+      this.clearActiveLoadRecoveryMarker();
+    }
+  }
+
+  private getSelectedMemoryRisk(): MemoryRiskAssessment {
+    const model = this.getSelectedModel();
+    const resolved = this.getEffectiveDtypeResolution();
+    const device = this.getSelectedDevice();
+    return assessModelMemoryRisk(model, resolved, device, this.memoryRiskEnv);
   }
 
   getStateSnapshot() {
@@ -1049,21 +1151,30 @@ export class AppController {
     const topKInput = this.root.querySelector<HTMLInputElement>('#input-top-k');
     if (topKInput) topKInput.value = String(this.generationConfig.topK);
 
-    // Sync dtype preview box
+    // Sync dtype & device-memory risk preview box
     const resolved = this.getEffectiveDtypeResolution();
     const expectedBytes = getResolvedDownloadBytes(model, resolved, true);
+    const risk = this.getSelectedMemoryRisk();
     const previewEl = this.root.querySelector<HTMLElement>('#dtype-preview-box');
     if (previewEl) {
-      previewEl.className = resolved.adjusted
-        ? 'notice-box notice-box--warn'
-        : 'notice-box';
+      previewEl.className =
+        risk.level === 'high'
+          ? 'notice-box notice-box--danger'
+          : resolved.adjusted || risk.level === 'caution'
+            ? 'notice-box notice-box--warn'
+            : 'notice-box';
       const warningLine =
         resolved.adjusted && resolved.reason
           ? `<span>⚠ ${escapeHtml(resolved.reason)}</span>`
           : '';
+      const memoryLine =
+        risk.level !== 'ok'
+          ? `<span>${risk.level === 'high' ? '🛑' : '⚠'} ${escapeHtml(risk.headline)}${risk.detail ? ` ${escapeHtml(risk.detail)}` : ''}</span>`
+          : '';
       previewEl.innerHTML = `
         <strong>実効量子化: ${escapeHtml(resolved.dtype)} (予想取得サイズ: ${escapeHtml(formatBytes(expectedBytes))})</strong>
-        ${warningLine}`;
+        ${warningLine}
+        ${memoryLine}`;
     }
 
     this.syncActionButtons();
@@ -1353,6 +1464,24 @@ export class AppController {
 
     const model = this.getSelectedModel();
     const resolved = this.getEffectiveDtypeResolution();
+    const memoryRisk = this.getSelectedMemoryRisk();
+
+    if (memoryRisk.level === 'high') {
+      const confirmed = await this.dialogHost.showConfirmDialog({
+        title: '端末メモリ上限によるクラッシュ・再読込の警告',
+        message: memoryRisk.headline,
+        detail:
+          memoryRisk.detail ??
+          'スマホや低メモリ環境では Qwen 3.5 0.8B (WebGPU) を選択するか、他タブを閉じて実行してください。',
+        confirmLabel: 'このまま試行する',
+        cancelLabel: 'キャンセル',
+        danger: true,
+      });
+      if (!confirmed || this.disposed) {
+        return;
+      }
+    }
+
     this.isLoadingModel = true;
     this.loadProgress = {
       modelId: model.id,
@@ -1367,6 +1496,16 @@ export class AppController {
     this.renderLoadProgress();
     this.syncActionButtons();
     this.announcer?.announcePolite(`${model.name} のロードを開始します。`, { immediate: true });
+    this.saveActiveLoadRecoveryMarker({
+      modelId: model.id,
+      modelName: model.name,
+      dtype: resolved.dtype,
+      backend: device.backend,
+      startedAt: Date.now(),
+    });
+
+    let lastProgressRenderAt = 0;
+    let lastRenderedStage: ModelLoadProgress['stage'] | null = null;
 
     try {
       const loaded = await this.client.loadModel(
@@ -1379,7 +1518,16 @@ export class AppController {
         (progress) => {
           if (this.disposed) return;
           this.loadProgress = progress;
-          this.renderLoadProgress();
+          const now = Date.now();
+          if (
+            progress.stage !== lastRenderedStage ||
+            progress.stage !== 'downloading' ||
+            now - lastProgressRenderAt >= 80
+          ) {
+            lastRenderedStage = progress.stage;
+            lastProgressRenderAt = now;
+            this.renderLoadProgress();
+          }
           this.announcer?.announcePolite(
             `${formatLoadStageLabel(progress.stage)}: ${Math.round(progress.overallProgressPct)}%`
           );
@@ -1421,6 +1569,7 @@ export class AppController {
       };
       this.announcer?.announceAssertive(`モデルのロードに失敗しました。${msg}`);
     } finally {
+      this.clearActiveLoadRecoveryMarker();
       this.isLoadingModel = false;
       this.renderLoadProgress();
       this.syncModelControls();

@@ -1,4 +1,5 @@
-import type { ModelId, ModelSpec, QuantDtype } from '../types.ts';
+import { formatBytes } from '../models/catalog.ts';
+import type { DeviceOption, ModelId, ModelSpec, QuantDtype, ResolvedDtype } from '../types.ts';
 
 /**
  * Snapshot of host battery telemetry obtained from the Web Battery Status API.
@@ -340,6 +341,35 @@ function parseParameterCountBillions(parameterLabel: string): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 2;
 }
 
+export type MemoryRiskLevel = 'ok' | 'caution' | 'high';
+
+export interface MemoryRiskEnvironment {
+  userAgent?: string;
+  maxTouchPoints?: number;
+  deviceMemoryGb?: number;
+  jsHeapSizeLimitBytes?: number;
+  coarsePointer?: boolean;
+}
+
+export interface MobileDeviceContext {
+  isMobile: boolean;
+  deviceMemoryGb?: number;
+}
+
+export interface MemoryRiskAssessment {
+  level: MemoryRiskLevel;
+  isMobile: boolean;
+  estimatedRuntimeBytes: number;
+  estimatedLoadPeakBytes: number;
+  estimatedTabBudgetBytes?: number;
+  headline: string;
+  detail?: string;
+}
+
+const BYTES_PER_GIB = 1024 ** 3;
+const MOBILE_DEFAULT_TAB_BUDGET_BYTES = Math.round(1.5 * BYTES_PER_GIB);
+const WASM32_SAFE_RUNTIME_LIMIT_BYTES = Math.round(3.2 * BYTES_PER_GIB);
+
 /**
  * Estimate total runtime memory/VRAM footprint (in bytes) for text-only inference:
  * model ONNX weights + tokenizer + KV cache for `contextTokens` + runtime activation buffers.
@@ -347,9 +377,10 @@ function parseParameterCountBillions(parameterLabel: string): number {
 export function estimateModelMemoryBytes(
   model: ModelSpec,
   dtype: QuantDtype,
-  contextTokens = DEFAULT_CONTEXT_TOKENS
+  contextTokens = DEFAULT_CONTEXT_TOKENS,
+  overrideWeightsBytes?: number
 ): number {
-  const weightsBytes = model.textOnlyBytesByDtype[dtype] ?? 0;
+  const weightsBytes = overrideWeightsBytes ?? model.textOnlyBytesByDtype[dtype] ?? 0;
   const safeTokens =
     typeof contextTokens === 'number' && Number.isFinite(contextTokens)
       ? Math.min(model.contextLength, Math.max(0, Math.round(contextTokens)))
@@ -368,4 +399,167 @@ export function estimateModelMemoryBytes(
     Math.max(0, model.tokenizerBytes);
 
   return Math.round(Math.max(0, weightsBytes) + kvCacheBytes + activationAndRuntimeBytes);
+}
+
+/**
+ * Detect smartphone/tablet browser contexts (iOS Safari, iPadOS Safari, Android browsers)
+ * and read `navigator.deviceMemory` without misclassifying desktop touchscreens.
+ */
+export function detectMobileDeviceContext(
+  env?: MemoryRiskEnvironment
+): MobileDeviceContext {
+  const nav =
+    typeof navigator !== 'undefined'
+      ? (navigator as Navigator & { deviceMemory?: unknown; maxTouchPoints?: number })
+      : undefined;
+
+  const ua = env?.userAgent ?? nav?.userAgent ?? '';
+  const maxTouchPoints =
+    env?.maxTouchPoints ?? (typeof nav?.maxTouchPoints === 'number' ? nav.maxTouchPoints : 0);
+
+  const rawDeviceMem =
+    env && 'deviceMemoryGb' in env
+      ? env.deviceMemoryGb
+      : typeof nav?.deviceMemory === 'number'
+        ? nav.deviceMemory
+        : undefined;
+  const deviceMemoryGb =
+    typeof rawDeviceMem === 'number' && Number.isFinite(rawDeviceMem) && rawDeviceMem > 0
+      ? rawDeviceMem
+      : undefined;
+
+  const hasCoarsePointer =
+    env?.coarsePointer ??
+    (typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(pointer: coarse)').matches
+      : false);
+
+  const uaLooksMobile = /Android|iPhone|iPad|iPod|Mobile|webOS|BlackBerry|IEMobile|Opera Mini/i.test(
+    ua
+  );
+  const isIpadDesktopUa = /Macintosh/i.test(ua) && maxTouchPoints > 1;
+  const isNonDesktopCoarse = hasCoarsePointer && !/Windows NT|Linux x86_64|X11/i.test(ua) && ua === '';
+
+  return {
+    isMobile: uaLooksMobile || isIpadDesktopUa || isNonDesktopCoarse,
+    ...(deviceMemoryGb !== undefined ? { deviceMemoryGb } : {}),
+  };
+}
+
+/**
+ * Assess end-of-download ONNX initialization memory risk so smartphones and low-RAM
+ * browsers warn cleanly before exceeding per-tab Jetsam / OOM / wasm32 ceilings.
+ */
+export function assessModelMemoryRisk(
+  model: ModelSpec,
+  resolved: Pick<ResolvedDtype, 'dtype' | 'effectiveWeightsBytes'>,
+  device: Pick<DeviceOption, 'backend' | 'limits'> | undefined,
+  env?: MemoryRiskEnvironment
+): MemoryRiskAssessment {
+  const ctx = detectMobileDeviceContext(env);
+  const effectiveWeightsBytes =
+    resolved.effectiveWeightsBytes ?? model.textOnlyBytesByDtype[resolved.dtype] ?? 0;
+  const estimatedRuntimeBytes = estimateModelMemoryBytes(
+    model,
+    resolved.dtype,
+    DEFAULT_CONTEXT_TOKENS,
+    effectiveWeightsBytes
+  );
+  const estimatedLoadPeakBytes = Math.round(
+    effectiveWeightsBytes * 1.55 +
+      Math.max(MIN_RUNTIME_OVERHEAD_BYTES, effectiveWeightsBytes * 0.15) +
+      Math.max(0, model.tokenizerBytes)
+  );
+
+  // 1. CPU/WASM 32-bit linear address space ceiling (~3.2–4 GiB regardless of desktop/mobile)
+  if (device?.backend === 'wasm' && estimatedRuntimeBytes >= WASM32_SAFE_RUNTIME_LIMIT_BYTES) {
+    return {
+      level: 'high',
+      isMobile: ctx.isMobile,
+      estimatedRuntimeBytes,
+      estimatedLoadPeakBytes,
+      estimatedTabBudgetBytes: WASM32_SAFE_RUNTIME_LIMIT_BYTES,
+      headline: `CPU (WASM) で ${model.name} (${resolved.dtype}) を読み込むと推定 ${formatBytes(estimatedRuntimeBytes)} 以上となり、WASM のメモリ上限を超えてクラッシュ・再読込する可能性が高いです。`,
+      detail: 'WebGPU デバイスへの切替、または Qwen 3.5 0.8B などの軽量モデルをおすすめします。',
+    };
+  }
+
+  // 2. Smartphone / tablet per-tab memory limits (WebKit Jetsam / Android LMKD)
+  if (ctx.isMobile) {
+    const budgetBytes =
+      ctx.deviceMemoryGb !== undefined
+        ? Math.round(Math.min(ctx.deviceMemoryGb * 0.42, 2.2) * BYTES_PER_GIB)
+        : MOBILE_DEFAULT_TAB_BUDGET_BYTES;
+
+    if (estimatedLoadPeakBytes > budgetBytes * 1.15) {
+      return {
+        level: 'high',
+        isMobile: true,
+        estimatedRuntimeBytes,
+        estimatedLoadPeakBytes,
+        estimatedTabBudgetBytes: budgetBytes,
+        headline: `スマホ/モバイル環境では ${model.name} (${resolved.dtype}) の読み込み終盤メモリが推定 ${formatBytes(estimatedLoadPeakBytes)} に達し、タブの上限 (目安 ${formatBytes(budgetBytes)}) を超えて強制終了・再読込される可能性が高いです。`,
+        detail:
+          'スマホでは超軽量な「Qwen 3.5 0.8B」+ WebGPU (または他のタブを閉じた状態) の利用を強く推奨します。',
+      };
+    }
+
+    if (estimatedLoadPeakBytes > budgetBytes * 0.78) {
+      return {
+        level: 'caution',
+        isMobile: true,
+        estimatedRuntimeBytes,
+        estimatedLoadPeakBytes,
+        estimatedTabBudgetBytes: budgetBytes,
+        headline: `スマホ環境での実行はメモリ余裕が少なめです (終盤ピーク推定 ${formatBytes(estimatedLoadPeakBytes)} / 目安 ${formatBytes(budgetBytes)})。`,
+        detail:
+          device?.backend === 'wasm'
+            ? 'スマホでは CPU (WASM) より WebGPU (利用可能時) + Qwen 3.5 0.8B の方が省メモリで安定します。他のタブを閉じて実行してください。'
+            : '他のアプリやブラウザタブを閉じてからロードすると安定します。',
+      };
+    }
+
+    return {
+      level: 'ok',
+      isMobile: true,
+      estimatedRuntimeBytes,
+      estimatedLoadPeakBytes,
+      estimatedTabBudgetBytes: budgetBytes,
+      headline: 'モバイル環境でも実行可能な軽量サイズです。',
+    };
+  }
+
+  // 3. Low-RAM Desktop / Chromebook (< 8 GiB deviceMemory; note Chrome caps navigator.deviceMemory at 8)
+  if (ctx.deviceMemoryGb !== undefined && ctx.deviceMemoryGb < 8) {
+    const budgetBytes = Math.round(ctx.deviceMemoryGb * 0.85 * BYTES_PER_GIB);
+    if (estimatedLoadPeakBytes > budgetBytes * 1.15) {
+      return {
+        level: 'high',
+        isMobile: false,
+        estimatedRuntimeBytes,
+        estimatedLoadPeakBytes,
+        estimatedTabBudgetBytes: budgetBytes,
+        headline: `端末の申告メモリ (${ctx.deviceMemoryGb} GiB) に対して ${model.name} の初期化メモリ (推定 ${formatBytes(estimatedLoadPeakBytes)}) が大きく、ブラウザがクラッシュする可能性があります。`,
+        detail: '軽量な Qwen 3.5 0.8B や 2B モデル、またはより小さい量子化 (q4f16 / q4) をおすすめします。',
+      };
+    }
+    if (estimatedLoadPeakBytes > budgetBytes * 0.8) {
+      return {
+        level: 'caution',
+        isMobile: false,
+        estimatedRuntimeBytes,
+        estimatedLoadPeakBytes,
+        estimatedTabBudgetBytes: budgetBytes,
+        headline: `端末メモリ (${ctx.deviceMemoryGb} GiB) に対して比較的大きいモデルです。他タブを閉じて実行してください。`,
+      };
+    }
+  }
+
+  return {
+    level: 'ok',
+    isMobile: false,
+    estimatedRuntimeBytes,
+    estimatedLoadPeakBytes,
+    headline: 'メモリ要件は許容範囲内です。',
+  };
 }

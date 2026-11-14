@@ -1393,4 +1393,84 @@ describe('DebouncedLiveAnnouncer & AppController integration', () => {
     await loadPromise;
     controller.dispose();
   });
+
+  it('guards oversized mobile downloads with high-risk confirmation dialog and surfaces crash-reload recovery banner', async () => {
+    const root = fakeDoc.createElement('div');
+    fakeDoc.body.appendChild(root);
+
+    const sessionStore = createMemoryStorage();
+    sessionStore.setItem(
+      'local-llm-test:active-load',
+      JSON.stringify({
+        modelId: 'gemma-4-e2b',
+        modelName: 'Gemma 4 E2B',
+        dtype: 'q4f16',
+        backend: 'webgpu',
+        startedAt: Date.now(),
+      })
+    );
+
+    const mockClient = {
+      probeDevices: vi.fn(async () => [GPU_DEVICE_F16, CPU_WASM_DEVICE]),
+      loadModel: vi.fn(async () => ({
+        modelId: 'gemma-4-e2b' as const,
+        device: GPU_DEVICE_F16,
+        effectiveDtype: 'q4f16' as const,
+        useExternalDataFormat: false,
+        loadTimeMs: 200,
+      })),
+      generate: vi.fn(),
+      abort: vi.fn(),
+      unloadModel: vi.fn(async () => undefined),
+      inspectCache: vi.fn(async () => []),
+      clearCache: vi.fn(),
+      dispose: vi.fn(),
+    } as unknown as LlmRuntimeClient;
+
+    const controller = new AppController(root as unknown as HTMLElement, {
+      client: mockClient,
+      benchmarkStore: new BenchmarkStore({ storage: null }),
+      themeStorage: createMemoryStorage(),
+      sessionStorage: sessionStore,
+      memoryRiskEnv: {
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) Mobile/15E148',
+      },
+      getStorageEstimateFn: async () => ({}),
+      sampleBatteryFn: async () => ({ supported: false, sampledAt: 1 }),
+      observeBatteryFn: async () => () => {},
+      telemetryEnv: { requestAnimationFrame: null, PerformanceObserver: null },
+    });
+
+    await controller.init();
+
+    // Crash recovery banner rendered and marker consumed on init
+    const banner = root.querySelector('#runtime-status-banner')!;
+    expect(banner.hidden).toBe(false);
+    expect(banner.textContent).toContain('Gemma 4 E2B');
+    expect(banner.textContent).toContain('Qwen 3.5 0.8B');
+    expect(sessionStore.getItem('local-llm-test:active-load')).toBeNull();
+
+    // Selecting heavy model on smartphone displays warning notice and asks before downloading
+    root.querySelector('button[data-select-model="gemma-4-e2b"]')!.click();
+    expect(root.querySelector('#dtype-preview-box')!.className).toContain('notice-box--danger');
+
+    // Cancelling confirmation prevents calling loadModel
+    const loadPromiseCancel = controller.handleLoadModel();
+    const cancelBtn = root.querySelector('dialog button[data-dialog-action="cancel"]');
+    expect(cancelBtn).not.toBeNull();
+    cancelBtn!.click();
+    await loadPromiseCancel;
+    expect(mockClient.loadModel).not.toHaveBeenCalled();
+
+    // Confirming allows proceeding intentionally and cleans active-load marker afterward
+    const loadPromiseConfirm = controller.handleLoadModel();
+    const confirmBtn = root.querySelector('dialog button[data-dialog-action="confirm"]');
+    expect(confirmBtn).not.toBeNull();
+    confirmBtn!.click();
+    await loadPromiseConfirm;
+    expect(mockClient.loadModel).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getItem('local-llm-test:active-load')).toBeNull();
+
+    controller.dispose();
+  });
 });

@@ -21,6 +21,8 @@ import {
   getPresetById,
 } from '../src/telemetry/presets.ts';
 import {
+  assessModelMemoryRisk,
+  detectMobileDeviceContext,
   estimateModelMemoryBytes,
   measureUserAgentMemoryBytes,
   observeBatteryChanges,
@@ -850,5 +852,89 @@ describe('presets', () => {
     expect(createDefaultGenerationConfig(llama, { enableThinking: true }).enableThinking).toBe(
       false
     );
+  });
+});
+
+describe('mobile memory risk assessment', () => {
+  it('accurately identifies smartphones/iPadOS vs Windows touchscreens', () => {
+    expect(
+      detectMobileDeviceContext({
+        userAgent:
+          'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1',
+      }).isMobile
+    ).toBe(true);
+
+    expect(
+      detectMobileDeviceContext({
+        userAgent:
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)',
+        maxTouchPoints: 5,
+      }).isMobile
+    ).toBe(true);
+
+    expect(
+      detectMobileDeviceContext({
+        userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/128.0 Mobile',
+        deviceMemoryGb: 8,
+      })
+    ).toEqual({ isMobile: true, deviceMemoryGb: 8 });
+
+    expect(
+      detectMobileDeviceContext({
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+        maxTouchPoints: 10,
+        deviceMemoryGb: 8,
+      })
+    ).toEqual({ isMobile: false, deviceMemoryGb: 8 });
+  });
+
+  it('flags oversized mobile models and WASM >3.2 GiB loads as high risk without false-alarming desktop WebGPU', () => {
+    const webgpuDev = makeWebGpuDevice();
+    const wasmDev = makeWasmDevice(1);
+
+    const qwen08 = getModelById('qwen-3.5-0.8b');
+    const qwen2 = getModelById('qwen-3.5-2b');
+    const gemmaE4b = getModelById('gemma-4-e4b');
+
+    const iphoneEnv = {
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile/15E148',
+    };
+    expect(
+      assessModelMemoryRisk(qwen08, { dtype: 'q4f16' }, webgpuDev, iphoneEnv).level
+    ).toBe('ok');
+    expect(
+      assessModelMemoryRisk(
+        qwen08,
+        { dtype: 'q4', effectiveWeightsBytes: 508_559_997 + 486_301_511 },
+        wasmDev,
+        iphoneEnv
+      ).level
+    ).toBe('caution');
+    expect(
+      assessModelMemoryRisk(qwen2, { dtype: 'q4f16' }, webgpuDev, iphoneEnv).level
+    ).toBe('high');
+    expect(
+      assessModelMemoryRisk(gemmaE4b, { dtype: 'q4f16' }, webgpuDev, iphoneEnv).level
+    ).toBe('high');
+
+    // Desktop Chrome caps deviceMemory at 8 even with >32GB RAM — do not warn on desktop WebGPU E4B
+    const desktopEnv = {
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0',
+      deviceMemoryGb: 8,
+    };
+    expect(
+      assessModelMemoryRisk(gemmaE4b, { dtype: 'q4f16' }, webgpuDev, desktopEnv).level
+    ).toBe('ok');
+
+    // Desktop WASM Gemma 4 E4B (>17 GB) still exceeds 32-bit WASM ceiling -> high
+    expect(
+      assessModelMemoryRisk(
+        gemmaE4b,
+        { dtype: 'q4', effectiveWeightsBytes: 13_958_647_953 + 3_380_723_437 },
+        wasmDev,
+        desktopEnv
+      ).level
+    ).toBe('high');
   });
 });

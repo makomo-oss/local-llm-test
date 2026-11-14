@@ -1,9 +1,13 @@
 import {
+  AutoConfig,
   AutoModelForCausalLM,
   AutoTokenizer,
   InterruptableStoppingCriteria,
+  ModelRegistry,
   TextStreamer,
   env,
+  type DataType,
+  type DeviceType,
   type PreTrainedModel,
   type PreTrainedTokenizer,
   type PretrainedModelOptions,
@@ -15,6 +19,7 @@ import {
   parseThinkingOutput,
   resolveEffectiveDtype,
 } from '../models/catalog.ts';
+import { detectMobileDeviceContext } from '../telemetry/systemProbe.ts';
 import type {
   DeviceOption,
   DownloadFileProgress,
@@ -29,13 +34,19 @@ import type {
   WorkerRequest,
   WorkerResponse,
 } from '../types.ts';
-import { clearModelCache, inspectModelCaches } from './cacheManager.ts';
+import { TRANSFORMERS_CACHE_NAME, clearModelCache, inspectModelCaches } from './cacheManager.ts';
 import {
   acquireGpuDeviceForPreference,
   getDeviceRuntimeDetails,
   probeComputeDevices,
   type AcquiredGpuDevice,
 } from './deviceProbe.ts';
+import {
+  createSerializedCacheAdapter,
+  filterCausalLmModelFiles,
+  precacheModelFilesSequentially,
+  resolveExternalDataAugmentedConfig,
+} from './modelPrecacher.ts';
 
 const TRAILING_SPECIAL_DELIMITER_REGEX =
   /(?:(?:<turn\|>|<\|im_end\|>|<\|eot_id\|>|<\|end_of_text\|>|<end_of_turn>|<eos>|<\|endoftext\|>|<\/s>)\s*)+$/;
@@ -306,6 +317,15 @@ function configureTransformersEnvironment(requestedWasmThreads?: number): number
   env.useBrowserCache = true;
   env.useWasmCache = true;
 
+  const serializedCache = createSerializedCacheAdapter(env.cacheKey || TRANSFORMERS_CACHE_NAME);
+  if (serializedCache) {
+    env.customCache = serializedCache;
+    env.useCustomCache = true;
+  } else {
+    env.useCustomCache = false;
+    env.customCache = null;
+  }
+
   const wasmEnv = env.backends?.onnx?.wasm;
   if (wasmEnv) {
     wasmEnv.proxy = false;
@@ -314,6 +334,12 @@ function configureTransformersEnvironment(requestedWasmThreads?: number): number
   }
 
   return activeThreads;
+}
+
+function yieldToEventLoop(delayMs = 0): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
 }
 
 function postWorkerMessage(message: WorkerResponse): void {
@@ -332,6 +358,41 @@ function formatWorkerError(err: unknown): string {
   } catch {
     return '不明なワーカーエラーが発生しました。';
   }
+}
+
+export function classifyModelLoadError(err: unknown): { code: string; message: string } {
+  const rawMessage = formatWorkerError(err);
+  const explicitCode =
+    err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+  const errName = err instanceof Error ? err.name : '';
+
+  if (
+    explicitCode === 'STORAGE_QUOTA_EXCEEDED' ||
+    errName === 'QuotaExceededError' ||
+    errName === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    /quota|storage limit/i.test(rawMessage)
+  ) {
+    return {
+      code: 'STORAGE_QUOTA_EXCEEDED',
+      message: `ブラウザの保存容量 (CacheStorage) が不足したためモデルを保存できませんでした: ${rawMessage}。不要なキャッシュを削除して空き容量を確保してください。`,
+    };
+  }
+
+  if (
+    /out of memory|bad_alloc|failed to allocate|cannot allocate|allocation failed|memory access out of bounds|invalid array length|oom/i.test(
+      rawMessage
+    )
+  ) {
+    return {
+      code: 'OUT_OF_MEMORY',
+      message: `メモリ不足のためモデルの初期化に失敗しました (${rawMessage})。スマホ・低メモリ環境では Qwen 3.5 0.8B (WebGPU) またはより小さい量子化をお試しください。`,
+    };
+  }
+
+  return {
+    code: 'MODEL_LOAD_FAILED',
+    message: `モデルのロードに失敗しました: ${rawMessage}`,
+  };
 }
 
 function buildWorkerDeviceOption(
@@ -647,18 +708,87 @@ async function handleLoadModel(
       ),
     });
 
+    // Yield briefly after disposing previous GPU/WASM resources so buffers can be reclaimed before download.
+    await yieldToEventLoop(40);
+
     const tokenizer = await AutoTokenizer.from_pretrained(modelSpec.repoId, {
       progress_callback: progressCallback,
     });
 
+    // Download uncached ONNX files sequentially one-at-a-time via streaming ReadableStream -> CacheStorage
+    // so mobile browsers never buffer multi-GB Uint8Arrays + duplicate response copies simultaneously.
+    let precachedInStorage = false;
+    try {
+      const config = (await AutoConfig.from_pretrained(modelSpec.repoId)) as unknown as Record<
+        string,
+        unknown
+      >;
+      const effectiveConfig = resolveExternalDataAugmentedConfig(
+        config,
+        resolved.useExternalDataFormat === true
+      );
+      const effectiveDtypeArg = (resolved.modelDtype ?? resolved.dtype) as
+        | DataType
+        | Record<string, DataType>;
+      const rawModelFiles = await ModelRegistry.get_model_files(modelSpec.repoId, {
+        config: effectiveConfig as never,
+        dtype: effectiveDtypeArg,
+        device: deviceOption.backend as DeviceType,
+      });
+      const modelFiles = filterCausalLmModelFiles(rawModelFiles, modelSpec.architecture);
+      const precacheResult = await precacheModelFilesSequentially({
+        repoId: modelSpec.repoId,
+        files: modelFiles,
+        cacheName: env.cacheKey || TRANSFORMERS_CACHE_NAME,
+        remoteHost: env.remoteHost,
+        remotePathTemplate: env.remotePathTemplate,
+        onFileProgress: (info) => {
+          progressCallback(info as ProgressInfo);
+        },
+      });
+      precachedInStorage = precacheResult.usedBrowserCache;
+    } catch (precacheErr) {
+      if (
+        precacheErr instanceof Error &&
+        ((precacheErr as Error & { code?: string }).code === 'STORAGE_QUOTA_EXCEEDED' ||
+          /モデルファイルの取得に失敗しました/.test(precacheErr.message))
+      ) {
+        throw precacheErr;
+      }
+      precachedInStorage = false;
+    }
+
+    if (precachedInStorage) {
+      await yieldToEventLoop(40);
+      sessionStageEmitted = true;
+      postWorkerMessage({
+        type: 'load-progress',
+        requestId: req.requestId,
+        progress: aggregator.buildStageProgress(
+          'initializing-session',
+          'ダウンロード完了・推論エンジン (ONNX) を初期化中...',
+          99
+        ),
+      });
+      await yieldToEventLoop(0);
+    }
+
+    const isConstrainedMobile = detectMobileDeviceContext().isMobile;
+    const baseSessionOptions: Record<string, unknown> = isConstrainedMobile
+      ? { enableCpuMemArena: false, enableMemPattern: false }
+      : {};
+
     const modelOptions: PretrainedModelOptions = {
       device: deviceOption.backend,
       dtype: (resolved.modelDtype ?? resolved.dtype) as PretrainedModelOptions['dtype'],
-      progress_callback: progressCallback,
+      // When precached, omit progress_callback so Transformers.js skips DefaultProgressCallback,
+      // which would otherwise pin every resolved Uint8Array weight buffer in .loads until load completes.
+      ...(precachedInStorage ? {} : { progress_callback: progressCallback }),
       ...(resolved.useExternalDataFormat === true ? { use_external_data_format: true } : {}),
       ...(deviceOption.backend === 'webgpu' && acquiredGpu
         ? {
             session_options: {
+              ...baseSessionOptions,
               executionProviders: [
                 {
                   name: 'webgpu',
@@ -667,7 +797,9 @@ async function handleLoadModel(
               ],
             },
           }
-        : {}),
+        : isConstrainedMobile
+          ? { session_options: baseSessionOptions }
+          : {}),
     };
 
     loadedModel = await AutoModelForCausalLM.from_pretrained(modelSpec.repoId, modelOptions);
@@ -721,11 +853,12 @@ async function handleLoadModel(
     }
     await disposeLoadedRuntime();
 
+    const classified = classifyModelLoadError(err);
     postWorkerMessage({
       type: 'error',
       requestId: req.requestId,
-      message: `モデルのロードに失敗しました: ${formatWorkerError(err)}`,
-      code: 'MODEL_LOAD_FAILED',
+      message: classified.message,
+      code: classified.code,
       recoverable: true,
     });
   } finally {
