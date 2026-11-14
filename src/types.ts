@@ -342,6 +342,11 @@ export type WorkerDeviceTarget =
       simdSupported?: boolean;
     };
 
+export interface WorkerMobileContext {
+  isMobile: boolean;
+  deviceMemoryGb?: number;
+}
+
 /**
  * Discriminated union of messages sent from the main thread to the LLM Web Worker.
  */
@@ -357,6 +362,7 @@ export type WorkerRequest =
       deviceTarget: WorkerDeviceTarget;
       dtype?: QuantDtype;
       useExternalDataFormat?: boolean;
+      mobileContext?: WorkerMobileContext;
     }
   | {
       type: 'generate';

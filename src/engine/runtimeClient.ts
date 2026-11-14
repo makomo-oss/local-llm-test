@@ -9,6 +9,7 @@ import type {
   ModelLoadProgress,
   QuantDtype,
   WorkerDeviceTarget,
+  WorkerMobileContext,
   WorkerRequest,
   WorkerResponse,
 } from '../types.ts';
@@ -40,6 +41,7 @@ export interface LoadModelParams {
   deviceTarget: WorkerDeviceTarget;
   dtype?: QuantDtype;
   useExternalDataFormat?: boolean;
+  mobileContext?: WorkerMobileContext;
 }
 
 export interface ModelLoadedResult {
@@ -131,6 +133,8 @@ export class LlmRuntimeClient {
   private disposed = false;
   private activeExclusiveOp: ExclusiveOperation | null = null;
   private activeGenerateRequestId: string | null = null;
+  private workerHasRuntimeState = false;
+  private workerHasLoadedModel = false;
   private readonly pending = new Map<string, PendingRequest>();
 
   private readonly handleMessage = (event: MessageEvent<WorkerResponse>): void => {
@@ -179,6 +183,7 @@ export class LlmRuntimeClient {
         return;
 
       case 'model-loaded': {
+        this.workerHasLoadedModel = true;
         const result: ModelLoadedResult = {
           modelId: response.modelId,
           device: response.device,
@@ -300,6 +305,15 @@ export class LlmRuntimeClient {
     params: LoadModelParams,
     onProgress?: (progress: ModelLoadProgress) => void
   ): Promise<ModelLoadedResult> {
+    if (!this.disposed && this.activeExclusiveOp === null && this.workerHasRuntimeState) {
+      // Recycle Web Worker between loads so previous WebAssembly.Memory pages and
+      // backend-specific WASM binaries reset cleanly without leaking OS RAM.
+      this.detachAndTerminateWorker();
+    }
+    if (!this.disposed && this.activeExclusiveOp === null) {
+      this.workerHasRuntimeState = true;
+    }
+
     return this.sendExclusiveRequest<ModelLoadedResult>(
       'load-model',
       {
@@ -311,6 +325,7 @@ export class LlmRuntimeClient {
         ...(params.useExternalDataFormat !== undefined
           ? { useExternalDataFormat: params.useExternalDataFormat }
           : {}),
+        ...(params.mobileContext !== undefined ? { mobileContext: params.mobileContext } : {}),
       },
       onProgress ? { onProgress } : undefined
     );
@@ -365,9 +380,16 @@ export class LlmRuntimeClient {
    * Unload the current model sessions and destroy any active WebGPU device.
    */
   unloadModel(): Promise<void> {
+    const hadLoadedModel = this.workerHasLoadedModel;
     return this.sendExclusiveRequest<void>('unload-model', {
       type: 'unload-model',
       requestId: this.nextRequestId('unload'),
+    }).then(() => {
+      if (hadLoadedModel) {
+        // Terminating the worker after unload ensures WebAssembly linear memory
+        // is actually reclaimed by mobile browsers (Safari/Android).
+        this.detachAndTerminateWorker();
+      }
     });
   }
 
@@ -443,6 +465,8 @@ export class LlmRuntimeClient {
 
   private detachAndTerminateWorker(): void {
     const activeWorker = this.worker;
+    this.workerHasRuntimeState = false;
+    this.workerHasLoadedModel = false;
     if (!activeWorker) {
       return;
     }

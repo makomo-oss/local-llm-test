@@ -30,6 +30,7 @@ import {
 } from '../telemetry/presets.ts';
 import {
   assessModelMemoryRisk,
+  detectMobileDeviceContext,
   observeBatteryChanges,
   sampleBatteryStatus,
   type BatterySnapshot,
@@ -1514,6 +1515,7 @@ export class AppController {
           deviceTarget: toWorkerDeviceTarget(device),
           dtype: resolved.dtype,
           ...(resolved.useExternalDataFormat ? { useExternalDataFormat: true } : {}),
+          mobileContext: detectMobileDeviceContext(this.memoryRiskEnv),
         },
         (progress) => {
           if (this.disposed) return;

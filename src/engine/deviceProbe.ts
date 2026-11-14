@@ -46,6 +46,19 @@ const ORT_REQUESTED_LIMIT_KEYS = [
 ] as const;
 
 /**
+ * Essential memory and workgroup limits kept in fallback WebGPU descriptors when
+ * drivers reject optional limits or experimental features (prevents reverting to
+ * 128 MiB storage binding / 256 MiB maxBufferSize defaults).
+ */
+const ORT_ESSENTIAL_LIMIT_KEYS = [
+  'maxStorageBufferBindingSize',
+  'maxBufferSize',
+  'maxComputeWorkgroupStorageSize',
+  'maxStorageBuffersPerShaderStage',
+  'maxComputeInvocationsPerWorkgroup',
+] as const;
+
+/**
  * Complete list of GPUSupportedLimits numeric properties (prototype getters in browsers).
  */
 const ALL_ADAPTER_LIMIT_KEYS = [
@@ -504,10 +517,11 @@ export function toWorkerDeviceTarget(device: DeviceOption): WorkerDeviceTarget {
 }
 
 function buildClampedRequiredLimits(
-  limits: Readonly<Record<string, number>>
+  limits: Readonly<Record<string, number>>,
+  keys: readonly string[] = ORT_REQUESTED_LIMIT_KEYS
 ): Record<string, number> {
   const requiredLimits: Record<string, number> = {};
-  for (const key of ORT_REQUESTED_LIMIT_KEYS) {
+  for (const key of keys) {
     const val = limits[key];
     if (typeof val === 'number' && Number.isFinite(val) && val > 0) {
       requiredLimits[key] = val;
@@ -548,8 +562,11 @@ export async function acquireGpuDeviceForPreference(
   const requiredFeatures = ORT_WEBGPU_FEATURES.filter((feature) =>
     featureSet.has(feature)
   ) as unknown as GPUFeatureName[];
+  const stableFeatures = (featureSet.has('shader-f16') ? ['shader-f16'] : []) as GPUFeatureName[];
   const requiredLimits = buildClampedRequiredLimits(limits);
+  const essentialLimits = buildClampedRequiredLimits(limits, ORT_ESSENTIAL_LIMIT_KEYS);
   const hasCustomLimits = Object.keys(requiredLimits).length > 0;
+  const hasEssentialLimits = Object.keys(essentialLimits).length > 0;
 
   let device: GPUDevice;
   let appliedCustomLimits = false;
@@ -563,15 +580,19 @@ export async function acquireGpuDeviceForPreference(
     appliedCustomLimits = hasCustomLimits;
   } catch {
     try {
-      device = await adapter.requestDevice(
-        requiredFeatures.length > 0 ? { requiredFeatures } : undefined
-      );
+      // Preserve stable FP16 + critical buffer/workgroup limits when experimental features
+      // (subgroups/timestamp-query) or secondary limits fail on mobile GPU drivers.
+      requestedFeaturesForDevice = [...stableFeatures];
+      device = await adapter.requestDevice({
+        ...(stableFeatures.length > 0 ? { requiredFeatures: stableFeatures } : {}),
+        ...(hasEssentialLimits ? { requiredLimits: essentialLimits } : {}),
+      });
+      appliedCustomLimits = hasEssentialLimits;
     } catch {
-      const minimalFeatures = (featureSet.has('shader-f16') ? ['shader-f16'] : []) as GPUFeatureName[];
       try {
-        requestedFeaturesForDevice = [...minimalFeatures];
+        requestedFeaturesForDevice = [...stableFeatures];
         device = await adapter.requestDevice(
-          minimalFeatures.length > 0 ? { requiredFeatures: minimalFeatures } : undefined
+          stableFeatures.length > 0 ? { requiredFeatures: stableFeatures } : undefined
         );
       } catch {
         requestedFeaturesForDevice = [];

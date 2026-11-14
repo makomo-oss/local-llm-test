@@ -1,4 +1,10 @@
 import { MODEL_CATALOG, getModelById } from '../models/catalog.ts';
+import {
+  clearOpfsModelEntries,
+  inspectOpfsModelEntries,
+  resolveOpfsRootDirectory,
+  type OpfsDirectoryLike,
+} from './opfsCacheStore.ts';
 import type { ModelCacheEntry, ModelCacheInfo, ModelId, ModelSpec } from '../types.ts';
 
 /**
@@ -163,66 +169,97 @@ function buildEmptyCacheInfo(model: ModelSpec, checkedAt: number): ModelCacheInf
   };
 }
 
+export interface CacheInspectionOptions {
+  opfsRoot?: OpfsDirectoryLike | null;
+}
+
 /**
- * Inspect `CacheStorage` (`transformers-cache`) entries for each requested catalog model
- * without loading large model weight bodies into memory.
+ * Inspect `CacheStorage` (`transformers-cache`) AND persistent OPFS (`local-llm-cache`)
+ * entries for each requested catalog model without loading large weight bodies into memory.
  */
 export async function inspectModelCaches(
-  models: readonly ModelSpec[] = MODEL_CATALOG
+  models: readonly ModelSpec[] = MODEL_CATALOG,
+  options: CacheInspectionOptions = {}
 ): Promise<ModelCacheInfo[]> {
   const checkedAt = Date.now();
   const cache = await openExistingTransformersCache();
-  if (!cache) {
+  const opfsRoot =
+    options.opfsRoot !== undefined ? options.opfsRoot : await resolveOpfsRootDirectory();
+
+  let requests: readonly Request[] = [];
+  if (cache) {
+    try {
+      requests = await cache.keys();
+    } catch {
+      requests = [];
+    }
+  }
+
+  const opfsEntries = await inspectOpfsModelEntries(opfsRoot).catch(() => []);
+  if (!cache && opfsEntries.length === 0) {
     return models.map((model) => buildEmptyCacheInfo(model, checkedAt));
   }
 
-  let requests: readonly Request[];
-  try {
-    requests = await cache.keys();
-  } catch {
-    return models.map((model) => buildEmptyCacheInfo(model, checkedAt));
-  }
-
-  const entriesByModelId = new Map<ModelId, ModelCacheEntry[]>();
+  const entriesByModelId = new Map<ModelId, Map<string, ModelCacheEntry>>();
   for (const model of models) {
-    entriesByModelId.set(model.id, []);
+    entriesByModelId.set(model.id, new Map());
   }
 
-  for (const request of requests) {
-    const url = request.url;
-    let matchedModel: ModelSpec | undefined;
-    let matchedFile: string | null = null;
+  const recordEntry = (model: ModelSpec, entry: ModelCacheEntry): void => {
+    entriesByModelId.get(model.id)?.set(entry.url, entry);
+  };
 
+  if (cache) {
+    for (const request of requests) {
+      const url = request.url;
+      let matchedModel: ModelSpec | undefined;
+      let matchedFile: string | null = null;
+
+      for (const model of models) {
+        const file = extractModelFileFromCacheUrl(url, model.repoId);
+        if (file !== null) {
+          matchedModel = model;
+          matchedFile = file;
+          break;
+        }
+      }
+
+      if (!matchedModel || matchedFile === null) {
+        continue;
+      }
+
+      let bytes = 0;
+      try {
+        const response = await cache.match(request);
+        bytes = await measureCachedResponseBytes(response, matchedFile);
+      } catch {
+        bytes = 0;
+      }
+
+      recordEntry(matchedModel, {
+        url,
+        file: matchedFile,
+        bytes,
+      });
+    }
+  }
+
+  for (const opfsEntry of opfsEntries) {
     for (const model of models) {
-      const file = extractModelFileFromCacheUrl(url, model.repoId);
+      const file = extractModelFileFromCacheUrl(opfsEntry.url, model.repoId);
       if (file !== null) {
-        matchedModel = model;
-        matchedFile = file;
+        recordEntry(model, {
+          url: opfsEntry.url,
+          file,
+          bytes: opfsEntry.bytes,
+        });
         break;
       }
     }
-
-    if (!matchedModel || matchedFile === null) {
-      continue;
-    }
-
-    let bytes = 0;
-    try {
-      const response = await cache.match(request);
-      bytes = await measureCachedResponseBytes(response, matchedFile);
-    } catch {
-      bytes = 0;
-    }
-
-    entriesByModelId.get(matchedModel.id)?.push({
-      url,
-      file: matchedFile,
-      bytes,
-    });
   }
 
   return models.map((model) => {
-    const files = (entriesByModelId.get(model.id) ?? []).sort((a, b) =>
+    const files = [...(entriesByModelId.get(model.id)?.values() ?? [])].sort((a, b) =>
       a.file.localeCompare(b.file)
     );
     const cachedBytes = files.reduce((sum, entry) => sum + entry.bytes, 0);
@@ -239,46 +276,55 @@ export async function inspectModelCaches(
 }
 
 /**
- * Clear cached entries for a specific model (`repoId` match) or delete the entire
- * `transformers-cache` bucket when `modelId` is omitted.
+ * Clear cached entries across both `CacheStorage` (`transformers-cache`) and persistent OPFS
+ * (`local-llm-cache`) for a specific model (`repoId` match) or everything when `modelId` is omitted.
  */
-export async function clearModelCache(modelId?: ModelId): Promise<ClearModelCacheResult> {
+export async function clearModelCache(
+  modelId?: ModelId,
+  options: CacheInspectionOptions = {}
+): Promise<ClearModelCacheResult> {
   const cacheStorage = getCacheStorage();
-  if (!cacheStorage) {
-    return { clearedBytes: 0, deletedEntries: 0 };
-  }
+  const opfsRoot =
+    options.opfsRoot !== undefined ? options.opfsRoot : await resolveOpfsRootDirectory();
 
   if (modelId === undefined) {
     let clearedBytes = 0;
     let deletedEntries = 0;
 
-    const existingCache = await openExistingTransformersCache();
-    if (existingCache) {
-      try {
-        const requests = await existingCache.keys();
-        for (const request of requests) {
-          deletedEntries += 1;
-          try {
-            const response = await existingCache.match(request);
-            clearedBytes += await measureCachedResponseBytes(response, request.url);
-          } catch {
-            // Keep counting entry even if size measurement fails.
+    if (cacheStorage) {
+      const existingCache = await openExistingTransformersCache();
+      if (existingCache) {
+        try {
+          const requests = await existingCache.keys();
+          for (const request of requests) {
+            deletedEntries += 1;
+            try {
+              const response = await existingCache.match(request);
+              clearedBytes += await measureCachedResponseBytes(response, request.url);
+            } catch {
+              // Keep counting entry even if size measurement fails.
+            }
           }
+        } catch {
+          // Proceed with full cache deletion even if key enumeration failed.
         }
+      }
+
+      try {
+        await cacheStorage.delete(TRANSFORMERS_CACHE_NAME);
       } catch {
-        // Proceed with full cache deletion even if key enumeration failed.
+        // Ignore CacheStorage delete error and still clear OPFS below
       }
     }
 
-    try {
-      const deleted = await cacheStorage.delete(TRANSFORMERS_CACHE_NAME);
-      if (!deleted && deletedEntries === 0) {
-        return { clearedBytes: 0, deletedEntries: 0 };
-      }
-      return { clearedBytes, deletedEntries };
-    } catch {
-      return { clearedBytes: 0, deletedEntries: 0 };
-    }
+    const opfsCleared = await clearOpfsModelEntries(opfsRoot).catch(() => ({
+      clearedBytes: 0,
+      deletedEntries: 0,
+    }));
+    return {
+      clearedBytes: clearedBytes + opfsCleared.clearedBytes,
+      deletedEntries: deletedEntries + opfsCleared.deletedEntries,
+    };
   }
 
   const model = getModelById(modelId);
@@ -286,47 +332,55 @@ export async function clearModelCache(modelId?: ModelId): Promise<ClearModelCach
     return { clearedBytes: 0, deletedEntries: 0 };
   }
 
-  const cache = await openExistingTransformersCache();
-  if (!cache) {
-    return { clearedBytes: 0, deletedEntries: 0 };
-  }
-
-  let requests: readonly Request[];
-  try {
-    requests = await cache.keys();
-  } catch {
-    return { clearedBytes: 0, deletedEntries: 0 };
-  }
-
   let clearedBytes = 0;
   let deletedEntries = 0;
 
-  for (const request of requests) {
-    const file = extractModelFileFromCacheUrl(request.url, model.repoId);
-    if (file === null) {
-      continue;
-    }
-
-    let entryBytes = 0;
-    try {
-      const response = await cache.match(request);
-      entryBytes = await measureCachedResponseBytes(response, file);
-    } catch {
-      entryBytes = 0;
-    }
-
-    try {
-      const deleted = await cache.delete(request);
-      if (deleted) {
-        deletedEntries += 1;
-        clearedBytes += entryBytes;
+  if (cacheStorage) {
+    const cache = await openExistingTransformersCache();
+    if (cache) {
+      let requests: readonly Request[] = [];
+      try {
+        requests = await cache.keys();
+      } catch {
+        requests = [];
       }
-    } catch {
-      // Ignore single-entry delete failure and continue clearing remaining entries.
+
+      for (const request of requests) {
+        const file = extractModelFileFromCacheUrl(request.url, model.repoId);
+        if (file === null) {
+          continue;
+        }
+
+        let entryBytes = 0;
+        try {
+          const response = await cache.match(request);
+          entryBytes = await measureCachedResponseBytes(response, file);
+        } catch {
+          entryBytes = 0;
+        }
+
+        try {
+          const deleted = await cache.delete(request);
+          if (deleted) {
+            deletedEntries += 1;
+            clearedBytes += entryBytes;
+          }
+        } catch {
+          // Ignore single-entry delete failure and continue clearing remaining entries.
+        }
+      }
     }
   }
 
-  return { clearedBytes, deletedEntries };
+  const opfsCleared = await clearOpfsModelEntries(opfsRoot, model.repoId).catch(() => ({
+    clearedBytes: 0,
+    deletedEntries: 0,
+  }));
+
+  return {
+    clearedBytes: clearedBytes + opfsCleared.clearedBytes,
+    deletedEntries: deletedEntries + opfsCleared.deletedEntries,
+  };
 }
 
 /**

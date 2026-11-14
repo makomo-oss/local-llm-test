@@ -44,9 +44,12 @@ import {
 import {
   createSerializedCacheAdapter,
   filterCausalLmModelFiles,
+  isOptionalModelFile,
   precacheModelFilesSequentially,
   resolveExternalDataAugmentedConfig,
 } from './modelPrecacher.ts';
+import { resolveOpfsRootDirectory, type OpfsDirectoryLike } from './opfsCacheStore.ts';
+import { SessionLoadCoordinator, withSerializedInferenceSessions } from './sessionSerializer.ts';
 
 const TRAILING_SPECIAL_DELIMITER_REGEX =
   /(?:(?:<turn\|>|<\|im_end\|>|<\|eot_id\|>|<\|end_of_text\|>|<end_of_turn>|<eos>|<\|endoftext\|>|<\/s>)\s*)+$/;
@@ -143,6 +146,7 @@ export function computeSpeedMetrics(
 interface ProgressAggregator {
   handle(info: ProgressInfo): ModelLoadProgress | null;
   buildStageProgress(stage: ModelLoadStage, message: string, pctOverride?: number): ModelLoadProgress;
+  registerExpectedFiles(files: readonly string[]): void;
 }
 
 /**
@@ -190,6 +194,20 @@ export function createDownloadProgressAggregator(
   };
 
   return {
+    registerExpectedFiles(files) {
+      for (const rawFile of files) {
+        const file = rawFile.trim();
+        if (file && !fileMap.has(file)) {
+          fileMap.set(file, {
+            file,
+            status: 'initiate',
+            loadedBytes: 0,
+            totalBytes: 0,
+            progressPct: 0,
+          });
+        }
+      }
+    },
     buildStageProgress(stage, message, pctOverride) {
       return snapshot(stage, message, pctOverride);
     },
@@ -302,22 +320,45 @@ const workerScope: DedicatedWorkerScopeLike | null =
     ? (self as unknown as DedicatedWorkerScopeLike)
     : null;
 
-function configureTransformersEnvironment(requestedWasmThreads?: number): number {
+function isIosOrMobileWebKit(): boolean {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  return /\b(?:iPhone|iPad|iPod|CriOS|FxiOS|EdgiOS|OPiOS)\b/i.test(ua);
+}
+
+interface ConfigureTransformersOptions {
+  requestedWasmThreads?: number;
+  backend?: ExecutionBackend;
+  isConstrainedMobile?: boolean;
+  opfsRoot?: OpfsDirectoryLike | null;
+  coordinator?: SessionLoadCoordinator;
+  signal?: AbortSignal;
+}
+
+function configureTransformersEnvironment(options: ConfigureTransformersOptions = {}): number {
   const runtimeDetails = getDeviceRuntimeDetails();
+  const maxThreads = options.isConstrainedMobile ? 2 : 4;
   const targetThreads =
     runtimeDetails.crossOriginIsolated &&
-    typeof requestedWasmThreads === 'number' &&
-    Number.isFinite(requestedWasmThreads) &&
-    requestedWasmThreads >= 1
-      ? Math.min(4, Math.floor(requestedWasmThreads))
-      : runtimeDetails.numThreads;
+    typeof options.requestedWasmThreads === 'number' &&
+    Number.isFinite(options.requestedWasmThreads) &&
+    options.requestedWasmThreads >= 1
+      ? Math.min(maxThreads, Math.floor(options.requestedWasmThreads))
+      : Math.min(maxThreads, runtimeDetails.numThreads);
   const activeThreads = runtimeDetails.crossOriginIsolated ? targetThreads : 1;
 
   env.allowLocalModels = false;
   env.useBrowserCache = true;
   env.useWasmCache = true;
 
-  const serializedCache = createSerializedCacheAdapter(env.cacheKey || TRANSFORMERS_CACHE_NAME);
+  const serializedCache = createSerializedCacheAdapter(
+    env.cacheKey || TRANSFORMERS_CACHE_NAME,
+    undefined,
+    {
+      opfsRoot: options.opfsRoot,
+      coordinator: options.coordinator,
+      signal: options.signal,
+    }
+  );
   if (serializedCache) {
     env.customCache = serializedCache;
     env.useCustomCache = true;
@@ -326,11 +367,44 @@ function configureTransformersEnvironment(requestedWasmThreads?: number): number
     env.customCache = null;
   }
 
-  const wasmEnv = env.backends?.onnx?.wasm;
+  const wasmEnv = env.backends?.onnx?.wasm as
+    | {
+        proxy?: boolean;
+        simd?: boolean;
+        numThreads?: number;
+        wasmPaths?: string | { mjs?: string; wasm?: string };
+        wasmBinary?: Uint8Array;
+      }
+    | undefined;
   if (wasmEnv) {
     wasmEnv.proxy = false;
     wasmEnv.simd = true;
     wasmEnv.numThreads = activeThreads;
+
+    // On CPU (WASM) execution or iOS WebKit browsers (Safari/Chrome/Firefox/Edge on iOS),
+    // avoid the 26.8 MiB asyncify WASM binary unless WebGPU actually requires it.
+    const hasWebGpuApi = typeof navigator !== 'undefined' && 'gpu' in navigator;
+    const preferNonAsyncify =
+      options.backend === 'wasm' || (isIosOrMobileWebKit() && !hasWebGpuApi);
+    if (preferNonAsyncify) {
+      const onnxVersion = (
+        env.backends?.onnx as { versions?: { web?: string } } | undefined
+      )?.versions?.web;
+      if (wasmEnv.wasmPaths && typeof wasmEnv.wasmPaths === 'object') {
+        if (typeof wasmEnv.wasmPaths.mjs === 'string') {
+          wasmEnv.wasmPaths.mjs = wasmEnv.wasmPaths.mjs.replace(/\.(?:asyncify|jsep)\./, '.');
+        }
+        if (typeof wasmEnv.wasmPaths.wasm === 'string') {
+          wasmEnv.wasmPaths.wasm = wasmEnv.wasmPaths.wasm.replace(/\.(?:asyncify|jsep)\./, '.');
+        }
+      } else if (onnxVersion) {
+        const prefix = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${onnxVersion}/dist/`;
+        wasmEnv.wasmPaths = {
+          mjs: `${prefix}ort-wasm-simd-threaded.mjs`,
+          wasm: `${prefix}ort-wasm-simd-threaded.wasm`,
+        };
+      }
+    }
   }
 
   return activeThreads;
@@ -374,7 +448,24 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
   ) {
     return {
       code: 'STORAGE_QUOTA_EXCEEDED',
-      message: `ブラウザの保存容量 (CacheStorage) が不足したためモデルを保存できませんでした: ${rawMessage}。不要なキャッシュを削除して空き容量を確保してください。`,
+      message: `ブラウザの保存容量 (OPFS / CacheStorage) が不足したためモデルを保存できませんでした: ${rawMessage}。不要なキャッシュを削除して空き容量を確保してください。`,
+    };
+  }
+
+  if (explicitCode === 'STORAGE_WRITE_FAILED') {
+    return {
+      code: 'STORAGE_WRITE_FAILED',
+      message: `モデルファイルの保存 (OPFS / CacheStorage) に失敗しました: ${rawMessage}。通常ブラウザタブで空き容量を確保のうえ再試行してください。`,
+    };
+  }
+
+  if (
+    explicitCode === 'WEBGPU_DEVICE_LOST' ||
+    /WebGPU デバイスが失われました|device is lost|device lost/i.test(rawMessage)
+  ) {
+    return {
+      code: 'WEBGPU_DEVICE_LOST',
+      message: `GPU ドライバまたはメモリ制限により WebGPU デバイスがリセットされました (${rawMessage})。CPU (WASM SIMD) またはより軽量なモデルをお試しください。`,
     };
   }
 
@@ -603,13 +694,24 @@ async function handleLoadModel(
   const loadStartMs = performance.now();
   let acquiredGpu: AcquiredGpuDevice | null = null;
   let loadedModel: PreTrainedModel | null = null;
+  const sessionCoordinator = new SessionLoadCoordinator();
+  const loadAbortController = new AbortController();
 
   try {
     await disposeLoadedRuntime();
 
-    const activeThreads = configureTransformersEnvironment(
-      req.deviceTarget.backend === 'wasm' ? req.deviceTarget.numThreads : undefined
-    );
+    const isConstrainedMobile =
+      req.mobileContext?.isMobile ?? detectMobileDeviceContext().isMobile;
+    const opfsRoot = await resolveOpfsRootDirectory();
+    const activeThreads = configureTransformersEnvironment({
+      requestedWasmThreads:
+        req.deviceTarget.backend === 'wasm' ? req.deviceTarget.numThreads : undefined,
+      backend: req.deviceTarget.backend,
+      isConstrainedMobile,
+      opfsRoot,
+      coordinator: sessionCoordinator,
+      signal: loadAbortController.signal,
+    });
     state.activeThreads = activeThreads;
 
     postWorkerMessage({
@@ -638,6 +740,14 @@ async function handleLoadModel(
       const boundDevice = acquiredGpu.device;
       state.gpuDevice = boundDevice;
 
+      const webgpuEnv = (env.backends?.onnx as { webgpu?: Record<string, unknown> } | undefined)
+        ?.webgpu;
+      if (webgpuEnv && typeof webgpuEnv === 'object') {
+        webgpuEnv.adapter = acquiredGpu.adapter;
+        webgpuEnv.device = acquiredGpu.device;
+        webgpuEnv.powerPreference = acquiredGpu.gpuPreference;
+      }
+
       if (boundDevice.lost && typeof boundDevice.lost.then === 'function') {
         void boundDevice.lost.then((lostInfo) => {
           if (intentionallyDestroyedGpuDevices.has(boundDevice)) {
@@ -647,6 +757,7 @@ async function handleLoadModel(
           const detail = lostInfo?.message ? `: ${lostInfo.message}` : '';
           const lossMessage = `WebGPU デバイスが失われました${reason}${detail}`;
           state.deviceLostError = lossMessage;
+          loadAbortController.abort(new Error(lossMessage));
 
           if (state.activeGenerationRequestId && state.activeStopper) {
             state.activeStopper.interrupt();
@@ -715,10 +826,10 @@ async function handleLoadModel(
       progress_callback: progressCallback,
     });
 
-    // Download uncached ONNX files sequentially one-at-a-time via streaming ReadableStream -> CacheStorage
-    // so mobile browsers never buffer multi-GB Uint8Arrays + duplicate response copies simultaneously.
+    // Download uncached ONNX files strictly one-by-one into persistent OPFS / CacheStorage
+    // so mobile browsers never buffer parallel multi-hundred-MiB weights in RAM.
     let precachedInStorage = false;
-    try {
+    {
       const config = (await AutoConfig.from_pretrained(modelSpec.repoId)) as unknown as Record<
         string,
         unknown
@@ -736,26 +847,20 @@ async function handleLoadModel(
         device: deviceOption.backend as DeviceType,
       });
       const modelFiles = filterCausalLmModelFiles(rawModelFiles, modelSpec.architecture);
+      aggregator.registerExpectedFiles(modelFiles.filter((file) => !isOptionalModelFile(file)));
       const precacheResult = await precacheModelFilesSequentially({
         repoId: modelSpec.repoId,
         files: modelFiles,
         cacheName: env.cacheKey || TRANSFORMERS_CACHE_NAME,
         remoteHost: env.remoteHost,
         remotePathTemplate: env.remotePathTemplate,
+        opfsRoot,
+        signal: loadAbortController.signal,
         onFileProgress: (info) => {
           progressCallback(info as ProgressInfo);
         },
       });
       precachedInStorage = precacheResult.usedBrowserCache;
-    } catch (precacheErr) {
-      if (
-        precacheErr instanceof Error &&
-        ((precacheErr as Error & { code?: string }).code === 'STORAGE_QUOTA_EXCEEDED' ||
-          /モデルファイルの取得に失敗しました/.test(precacheErr.message))
-      ) {
-        throw precacheErr;
-      }
-      precachedInStorage = false;
     }
 
     if (precachedInStorage) {
@@ -773,7 +878,6 @@ async function handleLoadModel(
       await yieldToEventLoop(0);
     }
 
-    const isConstrainedMobile = detectMobileDeviceContext().isMobile;
     const baseSessionOptions: Record<string, unknown> = isConstrainedMobile
       ? { enableCpuMemArena: false, enableMemPattern: false }
       : {};
@@ -802,7 +906,15 @@ async function handleLoadModel(
           : {}),
     };
 
-    loadedModel = await AutoModelForCausalLM.from_pretrained(modelSpec.repoId, modelOptions);
+    loadedModel = await withSerializedInferenceSessions(sessionCoordinator, () =>
+      AutoModelForCausalLM.from_pretrained(modelSpec.repoId, modelOptions)
+    );
+
+    // Release cached WASM Uint8Array binary once WebAssembly module has been compiled/instantiated.
+    const wasmEnvAfterLoad = env.backends?.onnx?.wasm as { wasmBinary?: Uint8Array } | undefined;
+    if (wasmEnvAfterLoad && wasmEnvAfterLoad.wasmBinary) {
+      wasmEnvAfterLoad.wasmBinary = undefined;
+    }
 
     if (state.deviceLostError) {
       throw new Error(state.deviceLostError);
@@ -844,6 +956,8 @@ async function handleLoadModel(
       ...(fallbackNotice ? { fallbackNotice } : {}),
     });
   } catch (err) {
+    loadAbortController.abort(err);
+    sessionCoordinator.abortAll(err);
     if (loadedModel) {
       try {
         await loadedModel.dispose();

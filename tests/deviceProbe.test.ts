@@ -446,4 +446,74 @@ describe('acquireGpuDeviceForPreference', () => {
       acquireGpuDeviceForPreference('fallback', { gpu: emptyGpu })
     ).rejects.toThrow(/fallback/);
   });
+
+  it('preserves essential ONNX buffer limits and shader-f16 on tier-2 fallback when experimental features fail', async () => {
+    const requestDeviceSpy = vi
+      .fn<NonNullable<MockAdapterSpec['requestDevice']>>()
+      .mockRejectedValueOnce(new Error('subgroups feature unsupported'))
+      .mockResolvedValueOnce(createMockDevice(['shader-f16']));
+
+    const adapter = createMockAdapter({
+      info: { vendor: 'qualcomm', architecture: 'adreno', device: '750', description: 'Adreno 750' },
+      features: ['shader-f16', 'subgroups', 'subgroup-size-control', 'timestamp-query'],
+      limits: {
+        maxStorageBufferBindingSize: 1_073_741_824,
+        maxBufferSize: 2_147_483_648,
+        maxComputeWorkgroupStorageSize: 32_768,
+        maxStorageBuffersPerShaderStage: 8,
+        maxComputeInvocationsPerWorkgroup: 1024,
+        maxUniformBufferBindingSize: 65_536,
+      },
+      requestDevice: requestDeviceSpy,
+    });
+
+    const mockGpu = {
+      requestAdapter: vi.fn(async () => adapter),
+    } as unknown as GPU;
+
+    const acquired = await acquireGpuDeviceForPreference('high-performance', { gpu: mockGpu });
+
+    expect(requestDeviceSpy).toHaveBeenCalledTimes(2);
+    const tier2Descriptor = requestDeviceSpy.mock.calls[1]?.[0];
+    expect(tier2Descriptor?.requiredFeatures).toEqual(['shader-f16']);
+    expect(tier2Descriptor?.requiredLimits).toEqual({
+      maxStorageBufferBindingSize: 1_073_741_824,
+      maxBufferSize: 2_147_483_648,
+      maxComputeWorkgroupStorageSize: 32_768,
+      maxStorageBuffersPerShaderStage: 8,
+      maxComputeInvocationsPerWorkgroup: 1024,
+    });
+    expect(acquired.appliedCustomLimits).toBe(true);
+    expect(acquired.supportsFp16).toBe(true);
+    expect(acquired.grantedFeatures).toEqual(['shader-f16']);
+  });
+
+  it('falls back all the way to bare requestDevice() when even shader-f16 fails', async () => {
+    const requestDeviceSpy = vi
+      .fn<NonNullable<MockAdapterSpec['requestDevice']>>()
+      .mockRejectedValueOnce(new Error('tier 1 failed'))
+      .mockRejectedValueOnce(new Error('tier 2 failed'))
+      .mockRejectedValueOnce(new Error('shader-f16 rejected'))
+      .mockResolvedValueOnce(createMockDevice([]));
+
+    const adapter = createMockAdapter({
+      info: { vendor: 'arm', description: 'Mali' },
+      features: ['shader-f16', 'subgroups'],
+      limits: {
+        maxStorageBufferBindingSize: 536_870_912,
+        maxBufferSize: 1_073_741_824,
+      },
+      requestDevice: requestDeviceSpy,
+    });
+
+    const acquired = await acquireGpuDeviceForPreference('default', {
+      gpu: { requestAdapter: vi.fn(async () => adapter) } as unknown as GPU,
+    });
+
+    expect(requestDeviceSpy).toHaveBeenCalledTimes(4);
+    expect(requestDeviceSpy.mock.calls[3]?.[0]).toBeUndefined();
+    expect(acquired.supportsFp16).toBe(false);
+    expect(acquired.appliedCustomLimits).toBe(false);
+    expect(acquired.grantedFeatures).toEqual([]);
+  });
 });

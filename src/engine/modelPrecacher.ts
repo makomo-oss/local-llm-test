@@ -1,4 +1,24 @@
 import { TRANSFORMERS_CACHE_NAME } from './cacheManager.ts';
+import {
+  isPersistentOpfsCapable,
+  readOpfsCachedResponse,
+  resolveOpfsRootDirectory,
+  shouldPreferPersistentOpfs,
+  writeResponseToOpfsStore,
+  writeStreamToOpfsStore,
+  type OpfsDirectoryLike,
+  type OpfsFileHandleLike,
+  type OpfsSyncAccessHandleLike,
+  type OpfsWritableStreamLike,
+} from './opfsCacheStore.ts';
+import { SessionLoadCoordinator, parseOnnxSessionGroup } from './sessionSerializer.ts';
+
+export type {
+  OpfsDirectoryLike,
+  OpfsFileHandleLike,
+  OpfsSyncAccessHandleLike,
+  OpfsWritableStreamLike,
+};
 
 /**
  * Lightweight Cache API subset required by Transformers.js `env.customCache`.
@@ -54,23 +74,13 @@ export interface PrecacheModelFilesOptions {
   /** Override streaming `Cache.put(new Response(ReadableStream))` support check. */
   supportsStreamingPut?: boolean;
   /** Optional OPFS root directory override for deterministic testing. */
-  opfsRoot?: OpfsDirectoryLike;
+  opfsRoot?: OpfsDirectoryLike | null;
 }
 
-export interface OpfsSyncAccessHandleLike {
-  write(buffer: BufferSource, options?: { at?: number }): number;
-  flush(): void;
-  close(): void;
-}
-
-export interface OpfsFileHandleLike {
-  createSyncAccessHandle?: () => Promise<OpfsSyncAccessHandleLike>;
-  getFile(): Promise<File | Blob>;
-}
-
-export interface OpfsDirectoryLike {
-  getFileHandle(name: string, options?: { create?: boolean }): Promise<OpfsFileHandleLike>;
-  removeEntry(name: string): Promise<void>;
+export interface SerializedCacheAdapterOptions {
+  opfsRoot?: OpfsDirectoryLike | null;
+  coordinator?: SessionLoadCoordinator;
+  signal?: AbortSignal;
 }
 
 export interface PrecacheModelFilesResult {
@@ -260,7 +270,21 @@ function wrapCacheWriteError(err: unknown, filePath: string): Error {
     (quotaError as Error & { code?: string }).code = 'STORAGE_QUOTA_EXCEEDED';
     return quotaError;
   }
-  return err instanceof Error ? err : new Error(String(err));
+  const existingCode =
+    err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+  if (err instanceof Error && typeof existingCode === 'string' && existingCode.length > 0) {
+    return err;
+  }
+  const detail = err instanceof Error ? err.message : String(err);
+  const wrapped = new Error(
+    `ストレージへの保存中にエラーが発生しました (${filePath}): ${detail}`,
+    err instanceof Error ? { cause: err } : undefined
+  );
+  if (err instanceof Error && err.name) {
+    wrapped.name = err.name;
+  }
+  (wrapped as Error & { code?: string }).code = 'STORAGE_WRITE_FAILED';
+  return wrapped;
 }
 
 /**
@@ -411,25 +435,130 @@ export async function probeStreamingCachePutSupport(cache: Cache): Promise<boole
   }
 }
 
-async function resolveOpfsRoot(override?: OpfsDirectoryLike): Promise<OpfsDirectoryLike | null> {
-  if (override) {
+async function resolveOpfsRoot(
+  override?: OpfsDirectoryLike | null
+): Promise<OpfsDirectoryLike | null> {
+  if (override !== undefined) {
     return override;
   }
-  try {
-    const storageManager = (
-      navigator as Navigator & { storage?: { getDirectory?: () => Promise<OpfsDirectoryLike> } }
-    ).storage;
-    if (storageManager && typeof storageManager.getDirectory === 'function') {
-      return await storageManager.getDirectory();
+  return resolveOpfsRootDirectory();
+}
+
+async function streamResponseToPersistentOpfs(options: {
+  opfsRoot: OpfsDirectoryLike;
+  url: string;
+  response: Response;
+  name: string;
+  filePath: string;
+  signal?: AbortSignal;
+  onFileProgress?: (info: PrecacheFileProgressInfo) => void;
+  minEmitIntervalMs?: number;
+  nowFn?: () => number;
+}): Promise<number> {
+  const {
+    opfsRoot,
+    url,
+    response,
+    name,
+    filePath,
+    signal,
+    onFileProgress,
+    minEmitIntervalMs = DEFAULT_EMIT_INTERVAL_MS,
+    nowFn = () => Date.now(),
+  } = options;
+
+  const knownTotal = resolveExpectedContentLength(response.headers);
+  const headers = buildPrecachedResponseHeaders(response.headers, knownTotal);
+
+  onFileProgress?.({
+    status: 'initiate',
+    name,
+    file: filePath,
+    loaded: 0,
+    ...(knownTotal !== undefined ? { total: knownTotal, progress: 0 } : {}),
+  });
+
+  if (!response.body) {
+    try {
+      const written = await writeResponseToOpfsStore(opfsRoot, url, response);
+      onFileProgress?.({
+        status: 'done',
+        name,
+        file: filePath,
+        loaded: written,
+        total: written,
+        progress: 100,
+      });
+      return written;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      throw wrapCacheWriteError(err, filePath);
     }
-  } catch {
-    // Ignore restricted OPFS (e.g. private browsing).
   }
-  return null;
+
+  let lastEmitAt = 0;
+  let lastEmittedBytes = 0;
+  const byteDeltaThreshold =
+    knownTotal !== undefined && knownTotal > 0
+      ? Math.max(MIN_PROGRESS_BYTE_DELTA, Math.floor(knownTotal * 0.01))
+      : MIN_PROGRESS_BYTE_DELTA;
+
+  try {
+    const written = await writeStreamToOpfsStore({
+      opfsRoot,
+      url,
+      stream: response.body,
+      headers,
+      expectedTotalBytes: knownTotal,
+      signal,
+      onProgress: (loadedBytes) => {
+        if (!onFileProgress) {
+          return;
+        }
+        const now = nowFn();
+        if (
+          now - lastEmitAt >= minEmitIntervalMs ||
+          loadedBytes - lastEmittedBytes >= byteDeltaThreshold
+        ) {
+          lastEmitAt = now;
+          lastEmittedBytes = loadedBytes;
+          const total =
+            knownTotal !== undefined && knownTotal >= loadedBytes ? knownTotal : undefined;
+          onFileProgress({
+            status: 'progress',
+            name,
+            file: filePath,
+            loaded: loadedBytes,
+            ...(total !== undefined
+              ? { total, progress: Math.min(100, (loadedBytes / total) * 100) }
+              : {}),
+          });
+        }
+      },
+    });
+
+    const total = knownTotal !== undefined && knownTotal >= written ? knownTotal : written;
+    onFileProgress?.({
+      status: 'done',
+      name,
+      file: filePath,
+      loaded: written,
+      total,
+      progress: 100,
+    });
+    return written;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw err;
+    }
+    throw wrapCacheWriteError(err, filePath);
+  }
 }
 
 async function streamResponseViaOpfsOrDirectCache(
-  options: StreamResponseToCacheOptions & { opfsRoot?: OpfsDirectoryLike }
+  options: StreamResponseToCacheOptions & { opfsRoot?: OpfsDirectoryLike | null }
 ): Promise<number> {
   const {
     cache,
@@ -452,6 +581,7 @@ async function streamResponseViaOpfsOrDirectCache(
       const fileHandle = await opfsRoot.getFileHandle(OPFS_PRECACHE_TMP_FILE, { create: true });
       if (typeof fileHandle.createSyncAccessHandle === 'function') {
         accessHandle = await fileHandle.createSyncAccessHandle();
+        accessHandle.truncate?.(0);
 
         onFileProgress?.({
           status: 'initiate',
@@ -598,7 +728,19 @@ export async function precacheModelFilesSequentially(
     }
   }
 
-  if (!storage || typeof storage.open !== 'function' || !fetchFn) {
+  const opfsRoot = await resolveOpfsRoot(options.opfsRoot);
+  const persistentOpfsReady = isPersistentOpfsCapable(opfsRoot);
+
+  let cache: Cache | null = null;
+  if (storage && typeof storage.open === 'function') {
+    try {
+      cache = await storage.open(options.cacheName ?? TRANSFORMERS_CACHE_NAME);
+    } catch {
+      cache = null;
+    }
+  }
+
+  if ((!cache && !persistentOpfsReady) || !fetchFn) {
     return {
       usedBrowserCache: false,
       totalFiles: uniqueFiles.length,
@@ -608,9 +750,9 @@ export async function precacheModelFilesSequentially(
     };
   }
 
-  const cache = await storage.open(options.cacheName ?? TRANSFORMERS_CACHE_NAME);
-  const canStreamPut =
-    options.supportsStreamingPut ?? (await probeStreamingCachePutSupport(cache));
+  const canStreamPut = cache
+    ? (options.supportsStreamingPut ?? (await probeStreamingCachePutSupport(cache)))
+    : false;
   let downloadedFiles = 0;
   let skippedCachedFiles = 0;
   let downloadedBytes = 0;
@@ -626,7 +768,11 @@ export async function precacheModelFilesSequentially(
       remotePathTemplate: options.remotePathTemplate,
     });
 
-    const existing = await cache.match(url);
+    const existingOpfs = persistentOpfsReady
+      ? await readOpfsCachedResponse(opfsRoot, url)
+      : undefined;
+    const existingCache = existingOpfs || !cache ? undefined : await cache.match(url);
+    const existing = existingOpfs ?? existingCache;
     const cachedTotal = existing ? resolveExpectedContentLength(existing.headers) : undefined;
     const isBinaryFile = filePath.endsWith('.onnx') || filePath.includes('.onnx_data');
     const isEmptyCachedBinary = isBinaryFile && cachedTotal === 0;
@@ -653,6 +799,10 @@ export async function precacheModelFilesSequentially(
       continue;
     }
 
+    if (isEmptyCachedBinary && existingCache && cache) {
+      await cache.delete?.(url).catch(() => false);
+    }
+
     const response = await fetchFn(
       url,
       options.signal ? { signal: options.signal } : undefined
@@ -668,28 +818,56 @@ export async function precacheModelFilesSequentially(
       );
     }
 
-    const written = canStreamPut
-      ? await streamResponseToCache({
-          cache,
-          cacheKey: url,
-          response,
-          name: options.repoId,
-          filePath,
-          onFileProgress: options.onFileProgress,
-          minEmitIntervalMs: options.minEmitIntervalMs,
-          nowFn: options.nowFn,
-        })
-      : await streamResponseViaOpfsOrDirectCache({
-          cache,
-          cacheKey: url,
-          response,
-          name: options.repoId,
-          filePath,
-          onFileProgress: options.onFileProgress,
-          minEmitIntervalMs: options.minEmitIntervalMs,
-          nowFn: options.nowFn,
-          opfsRoot: options.opfsRoot,
-        });
+    const responseExpectedBytes = resolveExpectedContentLength(response.headers);
+    const storeInPersistentOpfs =
+      persistentOpfsReady &&
+      (!cache ||
+        !canStreamPut ||
+        shouldPreferPersistentOpfs(filePath, responseExpectedBytes));
+
+    let written: number;
+    if (storeInPersistentOpfs && opfsRoot) {
+      written = await streamResponseToPersistentOpfs({
+        opfsRoot,
+        url,
+        response,
+        name: options.repoId,
+        filePath,
+        signal: options.signal,
+        onFileProgress: options.onFileProgress,
+        minEmitIntervalMs: options.minEmitIntervalMs,
+        nowFn: options.nowFn,
+      });
+    } else if (cache && canStreamPut) {
+      written = await streamResponseToCache({
+        cache,
+        cacheKey: url,
+        response,
+        name: options.repoId,
+        filePath,
+        onFileProgress: options.onFileProgress,
+        minEmitIntervalMs: options.minEmitIntervalMs,
+        nowFn: options.nowFn,
+      });
+    } else if (cache) {
+      written = await streamResponseViaOpfsOrDirectCache({
+        cache,
+        cacheKey: url,
+        response,
+        name: options.repoId,
+        filePath,
+        onFileProgress: options.onFileProgress,
+        minEmitIntervalMs: options.minEmitIntervalMs,
+        nowFn: options.nowFn,
+        opfsRoot,
+      });
+    } else {
+      throw wrapCacheWriteError(
+        new Error('利用可能なブラウザストレージがありません。'),
+        filePath
+      );
+    }
+
     downloadedFiles += 1;
     downloadedBytes += written;
   }
@@ -704,21 +882,27 @@ export async function precacheModelFilesSequentially(
 }
 
 /**
- * Serialize `CacheStorage` reads/writes behind a single FIFO queue so split-session
- * `Promise.all` loads (`embed_tokens` + `decoder_model_merged`) do not decode multiple
- * giant `.onnx_data` IPC buffers simultaneously.
+ * Serialize storage reads/writes behind a FIFO queue AND coordinate multi-session
+ * ONNX loads (`embed_tokens` + `decoder_model_merged`) so two sessions never buffer
+ * hundreds of MiB of JS weights simultaneously. Checks persistent OPFS before CacheStorage.
  */
 export function createSerializedCacheAdapter(
   cacheName = TRANSFORMERS_CACHE_NAME,
-  cacheStorage?: CacheStorage
+  cacheStorage?: CacheStorage,
+  adapterOptions: SerializedCacheAdapterOptions = {}
 ): SerializedCacheAdapter | null {
   const storage = cacheStorage ?? (typeof caches !== 'undefined' ? caches : undefined);
-  if (!storage || typeof storage.open !== 'function') {
+  const opfsRoot = adapterOptions.opfsRoot ?? null;
+  const persistentOpfsReady = isPersistentOpfsCapable(opfsRoot);
+  if ((!storage || typeof storage.open !== 'function') && !persistentOpfsReady) {
     return null;
   }
 
   let cachePromise: Promise<Cache> | null = null;
-  const getBucket = (): Promise<Cache> => {
+  const getBucket = (): Promise<Cache> | null => {
+    if (!storage || typeof storage.open !== 'function') {
+      return null;
+    }
     if (!cachePromise) {
       cachePromise = storage.open(cacheName).catch((err) => {
         cachePromise = null;
@@ -738,17 +922,74 @@ export function createSerializedCacheAdapter(
     return run;
   };
 
+  const toUrlString = (req: RequestInfo | URL): string =>
+    typeof req === 'string' ? req : req instanceof URL ? req.href : req.url;
+
   return {
     async match(request: RequestInfo | URL, options?: CacheQueryOptions): Promise<Response | undefined> {
+      const urlStr = toUrlString(request);
+      if (adapterOptions.coordinator) {
+        const group = parseOnnxSessionGroup(urlStr);
+        if (group) {
+          await adapterOptions.coordinator.enterGroup(group, adapterOptions.signal);
+        }
+      }
+
       return enqueue(async () => {
-        const cache = await getBucket();
-        return cache.match(request, options);
+        if (persistentOpfsReady) {
+          const opfsHit = await readOpfsCachedResponse(opfsRoot, urlStr);
+          if (opfsHit) {
+            return opfsHit;
+          }
+        }
+        const bucketPromise = getBucket();
+        if (!bucketPromise) {
+          return undefined;
+        }
+        try {
+          const cache = await bucketPromise;
+          return await cache.match(request, options);
+        } catch {
+          return undefined;
+        }
       });
     },
     async put(request: RequestInfo | URL, response: Response): Promise<void> {
+      const urlStr = toUrlString(request);
       return enqueue(async () => {
-        const cache = await getBucket();
-        await cache.put(request, response);
+        const expectedLen = resolveExpectedContentLength(response.headers);
+        if (persistentOpfsReady && opfsRoot && shouldPreferPersistentOpfs(urlStr, expectedLen)) {
+          await writeResponseToOpfsStore(opfsRoot, urlStr, response);
+          return;
+        }
+
+        const bucketPromise = getBucket();
+        if (!bucketPromise) {
+          if (persistentOpfsReady && opfsRoot) {
+            await writeResponseToOpfsStore(opfsRoot, urlStr, response);
+          }
+          return;
+        }
+
+        let fallbackClone: Response | null = null;
+        if (persistentOpfsReady && opfsRoot) {
+          try {
+            fallbackClone = response.clone();
+          } catch {
+            fallbackClone = null;
+          }
+        }
+
+        try {
+          const cache = await bucketPromise;
+          await cache.put(request, response);
+        } catch (err) {
+          if (fallbackClone && persistentOpfsReady && opfsRoot && !isQuotaExceededError(err)) {
+            await writeResponseToOpfsStore(opfsRoot, urlStr, fallbackClone);
+            return;
+          }
+          throw err;
+        }
       });
     },
   };

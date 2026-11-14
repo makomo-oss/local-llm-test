@@ -31,6 +31,24 @@ import {
   type WorkerLike,
 } from '../src/engine/runtimeClient.ts';
 import {
+  OPFS_MODEL_CACHE_DIR,
+  OPFS_PERSISTENT_THRESHOLD_BYTES,
+  buildOpfsEntryStem,
+  clearOpfsModelEntries,
+  inspectOpfsModelEntries,
+  readOpfsCachedResponse,
+  shouldPreferPersistentOpfs,
+  writeResponseToOpfsStore,
+  writeStreamToOpfsStore,
+  type OpfsDirectoryLike,
+} from '../src/engine/opfsCacheStore.ts';
+import {
+  SessionLoadCoordinator,
+  parseOnnxSessionGroup,
+  releaseSessionExternalData,
+  withSerializedInferenceSessions,
+} from '../src/engine/sessionSerializer.ts';
+import {
   getModelById,
   getModelDownloadBytes,
   getResolvedDownloadBytes,
@@ -1180,5 +1198,589 @@ describe('modelPrecacher & low-memory worker safeguards', () => {
     const quotaErr = new Error('Quota exceeded');
     quotaErr.name = 'QuotaExceededError';
     expect(classifyModelLoadError(quotaErr)).toMatchObject({ code: 'STORAGE_QUOTA_EXCEEDED' });
+
+    const writeErr = Object.assign(new Error('Unexpected internal error'), {
+      code: 'STORAGE_WRITE_FAILED',
+    });
+    expect(classifyModelLoadError(writeErr)).toMatchObject({ code: 'STORAGE_WRITE_FAILED' });
+
+    expect(
+      classifyModelLoadError(new Error('WebGPU validation failed: device is lost'))
+    ).toMatchObject({ code: 'WEBGPU_DEVICE_LOST' });
+
+    expect(classifyModelLoadError(new Error('network timeout'))).toMatchObject({
+      code: 'MODEL_LOAD_FAILED',
+    });
+  });
+});
+
+interface MockOpfsNode {
+  files: Map<string, Uint8Array>;
+  dirs: Map<string, MockOpfsNode>;
+}
+
+function createInMemoryOpfsRoot(
+  options: { supportsSyncAccess?: boolean } = {}
+): { root: OpfsDirectoryLike; tree: MockOpfsNode } {
+  const supportsSync = options.supportsSyncAccess !== false;
+  const tree: MockOpfsNode = { files: new Map(), dirs: new Map() };
+
+  const wrapDir = (node: MockOpfsNode): OpfsDirectoryLike => ({
+    async getDirectoryHandle(name, opts) {
+      let child = node.dirs.get(name);
+      if (!child) {
+        if (!opts?.create) {
+          throw new DOMException('NotFoundError', 'NotFoundError');
+        }
+        child = { files: new Map(), dirs: new Map() };
+        node.dirs.set(name, child);
+      }
+      return wrapDir(child);
+    },
+    async getFileHandle(name, opts) {
+      if (!node.files.has(name)) {
+        if (!opts?.create) {
+          throw new DOMException('NotFoundError', 'NotFoundError');
+        }
+        node.files.set(name, new Uint8Array(0));
+      }
+      const handle: ReturnType<OpfsDirectoryLike['getFileHandle']> extends Promise<infer H>
+        ? H
+        : never = {
+        async getFile() {
+          const data = node.files.get(name) ?? new Uint8Array(0);
+          return new Blob([Uint8Array.from(data)]);
+        },
+        ...(supportsSync
+          ? {
+              async createSyncAccessHandle() {
+                let buf = Uint8Array.from(node.files.get(name) ?? new Uint8Array(0));
+                let closed = false;
+                return {
+                  truncate(newSize: number) {
+                    const next = new Uint8Array(newSize);
+                    next.set(buf.subarray(0, Math.min(buf.length, newSize)));
+                    buf = next;
+                  },
+                  write(view, writeOpts) {
+                    if (closed) throw new Error('SyncAccessHandle closed');
+                    const src =
+                      view instanceof ArrayBuffer
+                        ? new Uint8Array(view)
+                        : new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+                    const at = writeOpts?.at ?? buf.length;
+                    const end = at + src.byteLength;
+                    if (end > buf.length) {
+                      const grown = new Uint8Array(end);
+                      grown.set(buf);
+                      buf = grown;
+                    }
+                    buf.set(src, at);
+                    return src.byteLength;
+                  },
+                  flush() {
+                    node.files.set(name, Uint8Array.from(buf));
+                  },
+                  close() {
+                    if (!closed) {
+                      closed = true;
+                      node.files.set(name, Uint8Array.from(buf));
+                    }
+                  },
+                };
+              },
+            }
+          : {}),
+        async createWritable() {
+          const chunks: Uint8Array[] = [];
+          let aborted = false;
+          return {
+            async write(data) {
+              const src =
+                data instanceof ArrayBuffer ? new Uint8Array(data) : Uint8Array.from(data);
+              chunks.push(src);
+            },
+            async close() {
+              if (aborted) return;
+              const total = chunks.reduce((s, c) => s + c.byteLength, 0);
+              const out = new Uint8Array(total);
+              let off = 0;
+              for (const c of chunks) {
+                out.set(c, off);
+                off += c.byteLength;
+              }
+              node.files.set(name, out);
+            },
+            async abort() {
+              aborted = true;
+            },
+          };
+        },
+      };
+      return handle;
+    },
+    async removeEntry(name, opts) {
+      if (node.files.delete(name)) return;
+      if (node.dirs.has(name)) {
+        const sub = node.dirs.get(name)!;
+        if (!opts?.recursive && (sub.files.size > 0 || sub.dirs.size > 0)) {
+          throw new DOMException('InvalidModificationError', 'InvalidModificationError');
+        }
+        node.dirs.delete(name);
+      }
+    },
+    async *entries() {
+      for (const name of node.files.keys()) {
+        yield [name, { kind: 'file', name }];
+      }
+      for (const name of node.dirs.keys()) {
+        yield [name, { kind: 'directory', name }];
+      }
+    },
+  });
+
+  return { root: wrapDir(tree), tree };
+}
+
+function makeChunkedStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+  let idx = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (idx >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[idx++]!);
+    },
+  });
+}
+
+describe('Mobile OPFS persistence, session serialization & worker lifecycle', () => {
+  it('enforces shouldPreferPersistentOpfs rules at format and 4 MiB boundaries', () => {
+    expect(shouldPreferPersistentOpfs('onnx/decoder_model_merged_q4.onnx')).toBe(true);
+    expect(shouldPreferPersistentOpfs('https://huggingface.co/a/b/resolve/main/onnx/model.onnx_data?download=1')).toBe(true);
+    expect(shouldPreferPersistentOpfs('onnx/model.onnx_data_1')).toBe(true);
+    expect(shouldPreferPersistentOpfs('tokenizer.json', OPFS_PERSISTENT_THRESHOLD_BYTES)).toBe(true);
+    expect(shouldPreferPersistentOpfs('tokenizer.json', OPFS_PERSISTENT_THRESHOLD_BYTES - 1)).toBe(false);
+    expect(shouldPreferPersistentOpfs('config.json', 1024)).toBe(false);
+  });
+
+  it('streams chunks via OPFS SyncAccessHandle and createWritable fallback, validates length, and cleans up corruption or aborts', async () => {
+    const { root, tree } = createInMemoryOpfsRoot({ supportsSyncAccess: true });
+    const url = 'https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX/resolve/main/onnx/embed_tokens_fp16.onnx_data';
+    const c1 = new Uint8Array([10, 20, 30, 40]);
+    const c2 = new Uint8Array([50, 60, 70]);
+
+    const written = await writeStreamToOpfsStore({
+      opfsRoot: root,
+      url,
+      stream: makeChunkedStream([c1, c2]),
+      headers: new Headers({ 'content-encoding': 'gzip', 'content-type': 'application/octet-stream' }),
+      expectedTotalBytes: 7,
+    });
+    expect(written).toBe(7);
+
+    const hit = await readOpfsCachedResponse(root, url);
+    expect(hit).toBeDefined();
+    expect(hit?.headers.get('content-length')).toBe('7');
+    expect(hit?.headers.get('content-encoding')).toBeNull();
+    expect(Array.from(new Uint8Array(await hit!.arrayBuffer()))).toEqual([10, 20, 30, 40, 50, 60, 70]);
+
+    // Corrupt truncated binary in OPFS should self-heal to undefined and delete corrupt entries
+    const cacheDirNode = tree.dirs.get(OPFS_MODEL_CACHE_DIR)!;
+    const stem = buildOpfsEntryStem(url);
+    cacheDirNode.files.set(`${stem}.bin`, new Uint8Array([1, 2]));
+    expect(await readOpfsCachedResponse(root, url)).toBeUndefined();
+    expect(cacheDirNode.files.has(`${stem}.meta.json`)).toBe(false);
+    expect(cacheDirNode.files.has(`${stem}.bin`)).toBe(false);
+
+    // Size mismatch & empty stream must reject and remove partial files
+    await expect(
+      writeStreamToOpfsStore({
+        opfsRoot: root,
+        url,
+        stream: makeChunkedStream([new Uint8Array([1, 2])]),
+        headers: new Headers(),
+        expectedTotalBytes: 99,
+      })
+    ).rejects.toThrow(/size mismatch/i);
+    expect(cacheDirNode.files.size).toBe(0);
+
+    await expect(
+      writeStreamToOpfsStore({
+        opfsRoot: root,
+        url,
+        stream: makeChunkedStream([]),
+        headers: new Headers(),
+      })
+    ).rejects.toThrow(/empty binary/i);
+    expect(cacheDirNode.files.size).toBe(0);
+
+    // Mid-stream abort must clean up partial entry and propagate AbortError
+    const ac = new AbortController();
+    let pulled = 0;
+    const abortingStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        if (pulled === 1) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          ac.abort();
+        } else {
+          controller.enqueue(new Uint8Array([4, 5]));
+        }
+      },
+    });
+    await expect(
+      writeStreamToOpfsStore({
+        opfsRoot: root,
+        url,
+        stream: abortingStream,
+        headers: new Headers(),
+        signal: ac.signal,
+      })
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(cacheDirNode.files.size).toBe(0);
+
+    // createWritable fallback without createSyncAccessHandle
+    const { root: writableRoot } = createInMemoryOpfsRoot({ supportsSyncAccess: false });
+    const writableWritten = await writeResponseToOpfsStore(
+      writableRoot,
+      url,
+      new Response(new Uint8Array([9, 8, 7, 6]), {
+        status: 200,
+        headers: { 'content-length': '4' },
+      })
+    );
+    expect(writableWritten).toBe(4);
+    const writableHit = await readOpfsCachedResponse(writableRoot, url);
+    expect(Array.from(new Uint8Array(await writableHit!.arrayBuffer()))).toEqual([9, 8, 7, 6]);
+  });
+
+  it('inspects and clears model caches seamlessly across both OPFS and CacheStorage', async () => {
+    const qwen = getModelById('qwen-3.5-0.8b');
+    const llama = getModelById('llama-3.2-3b');
+    const { root: opfsRoot, tree } = createInMemoryOpfsRoot();
+
+    const qwenOnnxUrl = buildRemoteModelFileUrl(qwen.repoId, 'onnx/decoder_model_merged_q4.onnx_data');
+    const qwenTokUrl = buildRemoteModelFileUrl(qwen.repoId, 'tokenizer.json');
+    const llamaOnnxUrl = buildRemoteModelFileUrl(llama.repoId, 'onnx/model_q4f16.onnx_data');
+
+    await writeStreamToOpfsStore({
+      opfsRoot,
+      url: qwenOnnxUrl,
+      stream: makeChunkedStream([new Uint8Array(12)]),
+      headers: new Headers(),
+      expectedTotalBytes: 12,
+    });
+    await writeStreamToOpfsStore({
+      opfsRoot,
+      url: llamaOnnxUrl,
+      stream: makeChunkedStream([new Uint8Array(20)]),
+      headers: new Headers(),
+      expectedTotalBytes: 20,
+    });
+    // Legacy temp spool file should also be removed when clearing everything
+    tree.files.set('__local_llm_precache_tmp__.bin', new Uint8Array([1, 2, 3]));
+
+    const mockStorage = createMockCacheStorage({
+      [TRANSFORMERS_CACHE_NAME]: {
+        [qwenTokUrl]: { contentLength: '5', blobBytes: 5 },
+      },
+    });
+    vi.stubGlobal('caches', mockStorage.storage);
+
+    try {
+      const inspected = await inspectModelCaches([qwen, llama], { opfsRoot });
+      expect(inspected[0]).toMatchObject({ modelId: qwen.id, cached: true, cachedBytes: 17, fileCount: 2 });
+      expect(inspected[1]).toMatchObject({ modelId: llama.id, cached: true, cachedBytes: 20, fileCount: 1 });
+
+      const clearedQwen = await clearModelCache(qwen.id, { opfsRoot });
+      expect(clearedQwen).toEqual({ clearedBytes: 17, deletedEntries: 2 });
+
+      const afterQwenClear = await inspectModelCaches([qwen, llama], { opfsRoot });
+      expect(afterQwenClear[0]?.cached).toBe(false);
+      expect(afterQwenClear[1]?.cachedBytes).toBe(20);
+
+      const clearedAll = await clearModelCache(undefined, { opfsRoot });
+      expect(clearedAll.clearedBytes).toBe(20);
+      expect(tree.files.has('__local_llm_precache_tmp__.bin')).toBe(false);
+      expect(await inspectOpfsModelEntries(opfsRoot)).toEqual([]);
+      expect((await clearOpfsModelEntries(null)).deletedEntries).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('serializes multi-session weight loading across constructSessions, frees externalData immediately, and aborts waiters on error', async () => {
+    expect(parseOnnxSessionGroup('https://hf.co/r/resolve/main/onnx/embed_tokens_fp16.onnx_data')).toBe('embed_tokens');
+    expect(parseOnnxSessionGroup('onnx/decoder_model_merged_q4.onnx')).toBe('decoder_model_merged');
+    expect(parseOnnxSessionGroup('onnx/vision_encoder_q4.onnx_data_1')).toBe('vision_encoder');
+    expect(parseOnnxSessionGroup('onnx/audio_encoder.onnx')).toBe('audio_encoder');
+    expect(parseOnnxSessionGroup('onnx/model_q4f16.onnx')).toBe('model');
+    expect(parseOnnxSessionGroup('tokenizer.json')).toBeNull();
+
+    const { root: opfsRoot } = createInMemoryOpfsRoot();
+    const embedUrl = 'https://hf.co/repo/resolve/main/onnx/embed_tokens_fp16.onnx_data';
+    const decoderUrl = 'https://hf.co/repo/resolve/main/onnx/decoder_model_merged_q4.onnx_data';
+    await writeResponseToOpfsStore(opfsRoot, embedUrl, new Response(new Uint8Array(10)));
+    await writeResponseToOpfsStore(opfsRoot, decoderUrl, new Response(new Uint8Array(10)));
+
+    const coordinator = new SessionLoadCoordinator();
+    const ac = new AbortController();
+    const adapter = createSerializedCacheAdapter(TRANSFORMERS_CACHE_NAME, undefined, {
+      opfsRoot,
+      coordinator,
+      signal: ac.signal,
+    })!;
+
+    const timeline: string[] = [];
+    let concurrentSessions = 0;
+    let peakConcurrent = 0;
+    const origTargetCreate = vi.fn(async (buf: unknown, opts?: { externalData?: Array<{ data: Uint8Array }> }) => {
+      expect(opts?.externalData?.[0]?.data.byteLength).toBe(10);
+      timeline.push(`create:${String(buf)}`);
+      concurrentSessions += 1;
+      peakConcurrent = Math.max(peakConcurrent, concurrentSessions);
+      await new Promise((r) => setTimeout(r, 15));
+      concurrentSessions -= 1;
+      timeline.push(`created:${String(buf)}`);
+      return { sessionId: buf };
+    });
+    const fakeSessionTarget = {
+      create: origTargetCreate as unknown as (
+        buf: unknown,
+        opts?: { externalData?: Array<{ path: string; data: Uint8Array }> }
+      ) => Promise<unknown>,
+    };
+
+    await withSerializedInferenceSessions(
+      coordinator,
+      async () => {
+        await Promise.all(
+          [
+            { group: 'embed_tokens', url: embedUrl },
+            { group: 'decoder_model_merged', url: decoderUrl },
+          ].map(async ({ group, url }) => {
+            const res = await adapter.match(url);
+            const buf = new Uint8Array(await res!.arrayBuffer());
+            timeline.push(`read:${group}`);
+            const externalData = [{ path: `${group}.onnx_data`, data: buf }];
+            await fakeSessionTarget.create(group, { externalData });
+            // After wrapped InferenceSession.create resolves, externalData must already be cleared
+            expect(externalData.length).toBe(0);
+          })
+        );
+      },
+      { target: fakeSessionTarget as never, yieldAfterCreateMs: 5 }
+    );
+
+    expect(peakConcurrent).toBe(1);
+    expect(timeline.indexOf('created:embed_tokens')).toBeLessThan(timeline.indexOf('read:decoder_model_merged'));
+    // Original create function must be restored after exit
+    expect(fakeSessionTarget.create).toBe(origTargetCreate);
+
+    // releaseSessionExternalData clears array entries safely even with empty/non-object input
+    const ext = [{ data: new Uint8Array(8) }];
+    releaseSessionExternalData({ externalData: ext });
+    expect(ext.length).toBe(0);
+
+    // Error propagation must abort queued session waiters without hanging and restore target.create
+    const errCoordinator = new SessionLoadCoordinator();
+    const errAdapter = createSerializedCacheAdapter(TRANSFORMERS_CACHE_NAME, undefined, {
+      opfsRoot,
+      coordinator: errCoordinator,
+    })!;
+    await errAdapter.match(embedUrl);
+    const pendingDecoder = errAdapter.match(decoderUrl);
+    const failingCreate = { create: vi.fn(async () => {}) as never };
+    await expect(
+      withSerializedInferenceSessions(
+        errCoordinator,
+        async () => {
+          throw new Error('session creation exploded');
+        },
+        { target: failingCreate, yieldAfterCreateMs: 0 }
+      )
+    ).rejects.toThrow('session creation exploded');
+    await expect(pendingDecoder).rejects.toThrow('session creation exploded');
+  });
+
+  it('recycles cache puts to OPFS when Cache.put fails and tags unrecoverable storage failures cleanly', async () => {
+    const { root: opfsRoot } = createInMemoryOpfsRoot();
+    const smallUrl = 'https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX/resolve/main/tokenizer.json';
+    const throwingCache: Cache = {
+      match: vi.fn(async () => undefined),
+      put: vi.fn(async () => {
+        throw new DOMException('Unexpected internal error', 'UnknownError');
+      }),
+      delete: vi.fn(async () => false),
+      keys: vi.fn(async () => []),
+      add: vi.fn(),
+      addAll: vi.fn(),
+      matchAll: vi.fn(async () => []),
+    } as unknown as Cache;
+
+    const adapter = createSerializedCacheAdapter(
+      TRANSFORMERS_CACHE_NAME,
+      {
+        open: async () => throwingCache,
+        has: async () => true,
+        delete: async () => true,
+        keys: async () => [],
+        match: async () => undefined,
+      } as unknown as CacheStorage,
+      { opfsRoot }
+    )!;
+
+    await adapter.put(smallUrl, new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
+    const recovered = await adapter.match(smallUrl);
+    expect(Array.from(new Uint8Array(await recovered!.arrayBuffer()))).toEqual([1, 2, 3, 4]);
+
+    // When both OPFS is unavailable and Cache.put throws UnknownError during precache, label STORAGE_WRITE_FAILED
+    await expect(
+      precacheModelFilesSequentially({
+        repoId: 'onnx-community/Qwen3.5-0.8B-ONNX',
+        files: ['onnx/decoder.onnx_data'],
+        opfsRoot: null,
+        cacheStorage: {
+          open: async () => throwingCache,
+          has: async () => true,
+          delete: async () => true,
+          keys: async () => [],
+          match: async () => undefined,
+        } as unknown as CacheStorage,
+        supportsStreamingPut: true,
+        fetchFn: vi.fn(
+          async () =>
+            new Response(makeChunkedStream([new Uint8Array([1, 2, 3])]), {
+              status: 200,
+              headers: { 'content-length': '3' },
+            })
+        ),
+      })
+    ).rejects.toMatchObject({ code: 'STORAGE_WRITE_FAILED' });
+  });
+
+  it('recycles Web Worker on repeat loadModel() and post-load unloadModel() while preserving idle workers', async () => {
+    const spawned: MockWorker[] = [];
+    const client = new LlmRuntimeClient({
+      workerFactory: () => {
+        const w = new MockWorker();
+        spawned.push(w);
+        return w;
+      },
+    });
+
+    // Unload before any model was loaded should NOT terminate the idle worker
+    const idleUnload = client.unloadModel();
+    expect(spawned).toHaveLength(1);
+    const firstWorker = spawned[0]!;
+    firstWorker.emitMessage({
+      type: 'model-unloaded',
+      requestId: firstWorker.postedMessages[0]!.requestId,
+    });
+    await idleUnload;
+    expect(firstWorker.terminated).toBe(false);
+
+    // First model load sets worker runtime state
+    const load1 = client.loadModel({
+      modelId: 'qwen-3.5-0.8b',
+      deviceTarget: { backend: 'wasm', numThreads: 2 },
+      mobileContext: { isMobile: true, deviceMemoryGb: 4 },
+    });
+    const load1Req = firstWorker.postedMessages.at(-1)!;
+    expect(load1Req.type).toBe('load-model');
+    if (load1Req.type === 'load-model') {
+      expect(load1Req.mobileContext).toEqual({ isMobile: true, deviceMemoryGb: 4 });
+    }
+    const wasmDevice: DeviceOption = {
+      id: 'wasm-cpu',
+      label: 'CPU',
+      backend: 'wasm',
+      features: [],
+      limits: {},
+      supportsFp16: false,
+      recommendedDtype: 'q4',
+      available: true,
+      runtimeDetails: SAMPLE_DEVICE.runtimeDetails,
+    };
+
+    firstWorker.emitMessage({
+      type: 'model-loaded',
+      requestId: load1Req.requestId,
+      modelId: 'qwen-3.5-0.8b',
+      device: wasmDevice,
+      effectiveDtype: 'q4',
+      useExternalDataFormat: true,
+      loadTimeMs: 120,
+    });
+    await load1;
+    expect(firstWorker.terminated).toBe(false);
+
+    // Subsequent loadModel must terminate previous worker to free WebAssembly.Memory before spawning next
+    const load2 = client.loadModel({
+      modelId: 'qwen-3.5-0.8b',
+      deviceTarget: { backend: 'wasm', numThreads: 1 },
+    });
+    expect(firstWorker.terminated).toBe(true);
+    expect(spawned).toHaveLength(2);
+    const secondWorker = spawned[1]!;
+    secondWorker.emitMessage({
+      type: 'model-loaded',
+      requestId: secondWorker.postedMessages[0]!.requestId,
+      modelId: 'qwen-3.5-0.8b',
+      device: wasmDevice,
+      effectiveDtype: 'q4',
+      useExternalDataFormat: true,
+      loadTimeMs: 80,
+    });
+    await load2;
+
+    // unloadModel after a model was loaded must terminate worker after model-unloaded to reclaim linear memory
+    const unloadAfterLoad = client.unloadModel();
+    const unloadReq = secondWorker.postedMessages.at(-1)!;
+    secondWorker.emitMessage({ type: 'model-unloaded', requestId: unloadReq.requestId });
+    await unloadAfterLoad;
+    expect(secondWorker.terminated).toBe(true);
+
+    client.dispose();
+  });
+
+  it('prevents premature 99% initializing-session flash across sequential multi-file downloads when files are pre-registered', () => {
+    const qwen = getModelById('qwen-3.5-0.8b');
+    const resolved = resolveEffectiveDtype(
+      qwen,
+      { backend: 'wasm', supportsFp16: false, features: [] },
+      'q4'
+    );
+    const aggregator = createDownloadProgressAggregator(qwen, resolved);
+    aggregator.registerExpectedFiles([
+      'onnx/embed_tokens_fp16.onnx',
+      'onnx/embed_tokens_fp16.onnx_data',
+      'onnx/decoder_model_merged_q4.onnx',
+      'onnx/decoder_model_merged_q4.onnx_data',
+    ]);
+
+    aggregator.handle({ status: 'done', name: qwen.repoId, file: 'onnx/embed_tokens_fp16.onnx' });
+    const mid = aggregator.handle({
+      status: 'done',
+      name: qwen.repoId,
+      file: 'onnx/embed_tokens_fp16.onnx_data',
+    });
+    expect(mid?.stage).toBe('downloading');
+    expect(mid?.overallProgressPct).toBeLessThan(99);
+
+    aggregator.handle({
+      status: 'done',
+      name: qwen.repoId,
+      file: 'onnx/decoder_model_merged_q4.onnx',
+    });
+    const readyToInit = aggregator.handle({
+      status: 'done',
+      name: qwen.repoId,
+      file: 'onnx/decoder_model_merged_q4.onnx_data',
+    });
+    expect(readyToInit?.stage).toBe('initializing-session');
+    expect(readyToInit?.overallProgressPct).toBe(99);
   });
 });
