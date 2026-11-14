@@ -42,12 +42,19 @@ import {
   type AcquiredGpuDevice,
 } from './deviceProbe.ts';
 import {
+  buildRemoteModelFileUrl,
   createSerializedCacheAdapter,
   filterCausalLmModelFiles,
   isOptionalModelFile,
   precacheModelFilesSequentially,
   resolveExternalDataAugmentedConfig,
 } from './modelPrecacher.ts';
+import {
+  createExternalBlobResolver,
+  createOnDemandEmbedTokensSession,
+  parseOnnxEmbedTokensPlan,
+} from './embedTokensSession.ts';
+import { ExternalDataSessionBridge } from './externalDataProxy.ts';
 import { resolveOpfsRootDirectory, type OpfsDirectoryLike } from './opfsCacheStore.ts';
 import { SessionLoadCoordinator, withSerializedInferenceSessions } from './sessionSerializer.ts';
 
@@ -332,7 +339,11 @@ interface ConfigureTransformersOptions {
   opfsRoot?: OpfsDirectoryLike | null;
   coordinator?: SessionLoadCoordinator;
   signal?: AbortSignal;
+  externalDataBridge?: ExternalDataSessionBridge;
 }
+
+const EMBED_TOKENS_EXTERNAL_DATA_REGEX =
+  /(?:^|\/)embed_tokens[^/]*\.onnx_data(?:_\d+)?(?:$|[?#])/i;
 
 function configureTransformersEnvironment(options: ConfigureTransformersOptions = {}): number {
   const runtimeDetails = getDeviceRuntimeDetails();
@@ -357,6 +368,16 @@ function configureTransformersEnvironment(options: ConfigureTransformersOptions 
       opfsRoot: options.opfsRoot,
       coordinator: options.coordinator,
       signal: options.signal,
+      ...(options.externalDataBridge
+        ? {
+            virtualizeExternalData: {
+              allowCacheStorage: (url: string) => EMBED_TOKENS_EXTERNAL_DATA_REGEX.test(url),
+              onMatched: (fileName: string, url: string) => {
+                options.externalDataBridge!.registerUrl(fileName, url);
+              },
+            },
+          }
+        : {}),
     }
   );
   if (serializedCache) {
@@ -456,6 +477,17 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
     return {
       code: 'STORAGE_WRITE_FAILED',
       message: `モデルファイルの保存 (OPFS / CacheStorage) に失敗しました: ${rawMessage}。通常ブラウザタブで空き容量を確保のうえ再試行してください。`,
+    };
+  }
+
+  if (
+    /maxStorageBufferBindingSize|maxBufferSize|exceeds max.*buffer size|createBuffer.*exceed|storage buffer.*limit|Binding size .* is larger than/i.test(
+      rawMessage
+    )
+  ) {
+    return {
+      code: 'WEBGPU_BUFFER_LIMIT',
+      message: `WebGPU デバイスの単一バッファ上限を超えたためモデルの初期化に失敗しました (${rawMessage})。CPU (WASM) への切替、または Qwen 3.5 0.8B などの軽量モデルをお試しください。`,
     };
   }
 
@@ -696,6 +728,7 @@ async function handleLoadModel(
   let loadedModel: PreTrainedModel | null = null;
   const sessionCoordinator = new SessionLoadCoordinator();
   const loadAbortController = new AbortController();
+  const externalDataBridge = new ExternalDataSessionBridge();
 
   try {
     await disposeLoadedRuntime();
@@ -711,6 +744,7 @@ async function handleLoadModel(
       opfsRoot,
       coordinator: sessionCoordinator,
       signal: loadAbortController.signal,
+      externalDataBridge,
     });
     state.activeThreads = activeThreads;
 
@@ -847,6 +881,17 @@ async function handleLoadModel(
         device: deviceOption.backend as DeviceType,
       });
       const modelFiles = filterCausalLmModelFiles(rawModelFiles, modelSpec.architecture);
+      for (const file of modelFiles) {
+        if (/\.onnx_data(?:_\d+)?$/i.test(file)) {
+          externalDataBridge.registerUrl(
+            file,
+            buildRemoteModelFileUrl(modelSpec.repoId, file, {
+              remoteHost: env.remoteHost,
+              remotePathTemplate: env.remotePathTemplate,
+            })
+          );
+        }
+      }
       aggregator.registerExpectedFiles(modelFiles.filter((file) => !isOptionalModelFile(file)));
       const precacheResult = await precacheModelFilesSequentially({
         repoId: modelSpec.repoId,
@@ -906,8 +951,88 @@ async function handleLoadModel(
           : {}),
     };
 
-    loadedModel = await withSerializedInferenceSessions(sessionCoordinator, () =>
-      AutoModelForCausalLM.from_pretrained(modelSpec.repoId, modelOptions)
+    const cacheName = env.cacheKey || TRANSFORMERS_CACHE_NAME;
+    const useOnDemandEmbed = resolved.onDemandEmbedTokens !== false;
+
+    loadedModel = await withSerializedInferenceSessions(
+      sessionCoordinator,
+      () => AutoModelForCausalLM.from_pretrained(modelSpec.repoId, modelOptions),
+      {
+        interceptCreate: async (modelData, sessionOptions) => {
+          if (!useOnDemandEmbed || !(modelData instanceof Uint8Array)) {
+            return null;
+          }
+          const plan = parseOnnxEmbedTokensPlan(modelData);
+          if (!plan) {
+            return null;
+          }
+          const isEmbedSession =
+            plan.outputNames.includes('inputs_embeds') ||
+            plan.externalLocations.some((loc) => /embed_tokens/i.test(loc));
+          if (!isEmbedSession) {
+            return null;
+          }
+
+          const urlByLocation = new Map<string, string>();
+          const inlineBlobs = new Map<string, Blob>();
+          const optsObj =
+            sessionOptions && typeof sessionOptions === 'object'
+              ? (sessionOptions as { externalData?: unknown[] })
+              : undefined;
+          if (Array.isArray(optsObj?.externalData)) {
+            for (const entry of optsObj.externalData) {
+              if (!entry || typeof entry !== 'object') {
+                continue;
+              }
+              const obj = entry as { path?: unknown; data?: unknown };
+              const pathKey = typeof obj.path === 'string' ? obj.path.replace(/^\.\//, '') : '';
+              const baseKey = pathKey ? (pathKey.split('/').pop() ?? pathKey) : '';
+              if (typeof obj.data === 'string' && pathKey) {
+                urlByLocation.set(pathKey, obj.data);
+                if (baseKey) {
+                  urlByLocation.set(baseKey, obj.data);
+                }
+              } else if (obj.data instanceof Uint8Array && pathKey) {
+                const blob = new Blob([obj.data as BlobPart]);
+                inlineBlobs.set(pathKey, blob);
+                if (baseKey) {
+                  inlineBlobs.set(baseKey, blob);
+                }
+              }
+            }
+          }
+
+          for (const loc of plan.externalLocations) {
+            if (!urlByLocation.has(loc)) {
+              const registered = externalDataBridge.resolveUrl(loc);
+              if (registered) {
+                urlByLocation.set(loc, registered);
+              }
+            }
+          }
+
+          const baseResolveBlob = createExternalBlobResolver({
+            urlByLocation,
+            opfsRoot,
+            cacheName,
+          });
+          return createOnDemandEmbedTokensSession(plan, async (location) => {
+            const clean = location.replace(/^\.\//, '');
+            const base = clean.split('/').pop() ?? clean;
+            const inline =
+              inlineBlobs.get(location) ?? inlineBlobs.get(clean) ?? inlineBlobs.get(base);
+            if (inline) {
+              return inline;
+            }
+            return baseResolveBlob(location);
+          });
+        },
+        prepareExternalData: (options) =>
+          externalDataBridge.prepareSessionExternalData(options, {
+            opfsRoot,
+            cacheName,
+          }),
+      }
     );
 
     // Release cached WASM Uint8Array binary once WebAssembly module has been compiled/instantiated.
@@ -976,6 +1101,7 @@ async function handleLoadModel(
       recoverable: true,
     });
   } finally {
+    externalDataBridge.closeAll();
     state.busyOperation = null;
   }
 }

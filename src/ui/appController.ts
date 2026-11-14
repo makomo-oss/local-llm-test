@@ -1641,8 +1641,13 @@ export class AppController {
     const memoryRisk = this.getSelectedMemoryRisk();
 
     if (memoryRisk.level === 'high') {
+      const isBufferLimitRisk = /単一バッファ上限|maxStorageBufferBindingSize|maxBufferSize/.test(
+        memoryRisk.headline
+      );
       const confirmed = await this.dialogHost.showConfirmDialog({
-        title: '端末メモリ上限によるクラッシュ・再読込の警告',
+        title: isBufferLimitRisk
+          ? 'ハードウェア・メモリ上限によるクラッシュ警告'
+          : '端末メモリ上限によるクラッシュ・再読込の警告',
         message: memoryRisk.headline,
         detail:
           memoryRisk.detail ??

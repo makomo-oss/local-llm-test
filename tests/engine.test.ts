@@ -538,13 +538,23 @@ describe('llm.worker pure helpers', () => {
     const aggregator = createDownloadProgressAggregator(qwen, resolved);
     const expectedWasmBytes = getResolvedDownloadBytes(qwen, resolved, true);
 
-    expect(expectedWasmBytes).toBe(994_861_508 + qwen.tokenizerBytes);
+    expect(expectedWasmBytes).toBe(633_308_015 + qwen.tokenizerBytes);
     const init = aggregator.handle({
       status: 'initiate',
       name: qwen.repoId,
-      file: 'onnx/embed_tokens_fp16.onnx_data',
+      file: 'onnx/embed_tokens_q4f16.onnx_data',
     });
     expect(init?.expectedTotalBytes).toBe(expectedWasmBytes);
+
+    const legacyResolved = resolveEffectiveDtype(
+      qwen,
+      { backend: 'wasm', supportsFp16: false, features: [] },
+      'q4',
+      { onDemandEmbedTokens: false }
+    );
+    expect(getResolvedDownloadBytes(qwen, legacyResolved, true)).toBe(
+      994_861_508 + qwen.tokenizerBytes
+    );
   });
 });
 

@@ -1,6 +1,7 @@
 import { TRANSFORMERS_CACHE_NAME } from './cacheManager.ts';
 import {
   isPersistentOpfsCapable,
+  openOpfsCachedBlob,
   readOpfsCachedResponse,
   resolveOpfsRootDirectory,
   shouldPreferPersistentOpfs,
@@ -77,10 +78,20 @@ export interface PrecacheModelFilesOptions {
   opfsRoot?: OpfsDirectoryLike | null;
 }
 
+export interface VirtualizeExternalDataOptions {
+  /** Predicate deciding whether a matched `.onnx_data*` URL may be virtualized as a URL string. */
+  shouldVirtualize?: (url: string) => boolean;
+  /** Allow virtualizing CacheStorage hits (not only OPFS), e.g. for on-demand sessions. */
+  allowCacheStorage?: (url: string) => boolean;
+  /** Invoked whenever a virtualized `.onnx_data*` hit is returned to Transformers.js. */
+  onMatched?: (fileName: string, url: string) => void;
+}
+
 export interface SerializedCacheAdapterOptions {
   opfsRoot?: OpfsDirectoryLike | null;
   coordinator?: SessionLoadCoordinator;
   signal?: AbortSignal;
+  virtualizeExternalData?: VirtualizeExternalDataOptions;
 }
 
 export interface PrecacheModelFilesResult {
@@ -881,6 +892,16 @@ export async function precacheModelFilesSequentially(
   };
 }
 
+function isOnnxExternalDataUrl(url: string): boolean {
+  const cleanUrl = (url.split('#')[0]?.split('?')[0] ?? url).trim();
+  return /\.onnx_data(?:_\d+)?$/i.test(cleanUrl);
+}
+
+function extractExternalDataFileName(url: string): string {
+  const cleanUrl = (url.split('#')[0]?.split('?')[0] ?? url).trim();
+  return cleanUrl.split('/').pop() ?? cleanUrl;
+}
+
 /**
  * Serialize storage reads/writes behind a FIFO queue AND coordinate multi-session
  * ONNX loads (`embed_tokens` + `decoder_model_merged`) so two sessions never buffer
@@ -894,6 +915,7 @@ export function createSerializedCacheAdapter(
   const storage = cacheStorage ?? (typeof caches !== 'undefined' ? caches : undefined);
   const opfsRoot = adapterOptions.opfsRoot ?? null;
   const persistentOpfsReady = isPersistentOpfsCapable(opfsRoot);
+  const virtualizeConfig = adapterOptions.virtualizeExternalData;
   if ((!storage || typeof storage.open !== 'function') && !persistentOpfsReady) {
     return null;
   }
@@ -936,10 +958,23 @@ export function createSerializedCacheAdapter(
       }
 
       return enqueue(async () => {
-        if (persistentOpfsReady) {
-          const opfsHit = await readOpfsCachedResponse(opfsRoot, urlStr);
-          if (opfsHit) {
-            return opfsHit;
+        const shouldVirtualize =
+          virtualizeConfig !== undefined &&
+          isOnnxExternalDataUrl(urlStr) &&
+          (virtualizeConfig.shouldVirtualize?.(urlStr) ?? true);
+
+        if (persistentOpfsReady && opfsRoot) {
+          if (shouldVirtualize) {
+            const opfsBlob = await openOpfsCachedBlob(opfsRoot, urlStr);
+            if (opfsBlob) {
+              virtualizeConfig.onMatched?.(extractExternalDataFileName(urlStr), urlStr);
+              return urlStr as unknown as Response;
+            }
+          } else {
+            const opfsHit = await readOpfsCachedResponse(opfsRoot, urlStr);
+            if (opfsHit) {
+              return opfsHit;
+            }
           }
         }
         const bucketPromise = getBucket();
@@ -948,7 +983,16 @@ export function createSerializedCacheAdapter(
         }
         try {
           const cache = await bucketPromise;
-          return await cache.match(request, options);
+          const cacheHit = await cache.match(request, options);
+          if (
+            cacheHit &&
+            shouldVirtualize &&
+            virtualizeConfig.allowCacheStorage?.(urlStr)
+          ) {
+            virtualizeConfig.onMatched?.(extractExternalDataFileName(urlStr), urlStr);
+            return urlStr as unknown as Response;
+          }
+          return cacheHit;
         } catch {
           return undefined;
         }

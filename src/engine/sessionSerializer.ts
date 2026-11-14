@@ -183,6 +183,20 @@ export interface SerializedSessionCreateHooks {
   };
   yieldAfterCreateMs?: number;
   onSessionCreated?: () => void;
+  /**
+   * Optional interceptor invoked before delegating to ORT `InferenceSession.create`.
+   * Return a session-like object to short-circuit ORT creation (e.g. on-demand
+   * `embed_tokens` streaming), or `null`/`undefined` to fall through to ORT.
+   */
+  interceptCreate?: (modelData: unknown, options: unknown) => Promise<unknown | null | undefined>;
+  /**
+   * Optional hook invoked right before `InferenceSession.create` to resolve/replace
+   * `sessionOptions.externalData` entries (e.g. streaming OPFS SyncAccessHandle proxies).
+   * May return a cleanup callback invoked in `finally` once ORT finishes reading weights.
+   */
+  prepareExternalData?: (
+    options: Record<string, unknown>
+  ) => Promise<(() => void | Promise<void>) | void>;
 }
 
 /**
@@ -215,7 +229,28 @@ export async function withSerializedInferenceSessions<T>(
     const run = async () => {
       // ORT InferenceSession.create supports (path|buffer, options?) or (buffer, byteOffset, byteLength, options?)
       const sessionOptions = arg2 === undefined && arg3 === undefined ? arg1 : arg3;
+      const modelData =
+        arg0 instanceof Uint8Array && typeof arg1 === 'number' && typeof arg2 === 'number'
+          ? arg0.subarray(arg1, arg1 + arg2)
+          : arg0;
+      let cleanupExternalData: (() => void | Promise<void>) | void = undefined;
       try {
+        if (hooks.interceptCreate) {
+          const intercepted = await hooks.interceptCreate(modelData, sessionOptions);
+          if (intercepted) {
+            hooks.onSessionCreated?.();
+            return intercepted as InferenceSession;
+          }
+        }
+        if (
+          hooks.prepareExternalData &&
+          sessionOptions &&
+          typeof sessionOptions === 'object'
+        ) {
+          cleanupExternalData = await hooks.prepareExternalData(
+            sessionOptions as Record<string, unknown>
+          );
+        }
         const session = await (
           origCreate as unknown as (...args: unknown[]) => Promise<InferenceSession>
         ).apply(this, [
@@ -227,11 +262,15 @@ export async function withSerializedInferenceSessions<T>(
         hooks.onSessionCreated?.();
         return session;
       } finally {
-        releaseSessionExternalData(sessionOptions);
-        if (yieldMs > 0) {
-          await new Promise<void>((resolve) => setTimeout(resolve, yieldMs));
+        try {
+          await cleanupExternalData?.();
+        } finally {
+          releaseSessionExternalData(sessionOptions);
+          if (yieldMs > 0) {
+            await new Promise<void>((resolve) => setTimeout(resolve, yieldMs));
+          }
+          coordinator.completeActiveGroup();
         }
-        coordinator.completeActiveGroup();
       }
     };
 

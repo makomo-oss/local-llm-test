@@ -447,29 +447,81 @@ export function detectMobileDeviceContext(
 }
 
 /**
- * Assess end-of-download ONNX initialization memory risk so smartphones and low-RAM
- * browsers warn cleanly before exceeding per-tab Jetsam / OOM / wasm32 ceilings.
+ * Assess end-of-download ONNX initialization memory & GPU buffer risk so smartphones,
+ * low-RAM browsers, and WebGPU devices warn cleanly before hitting Jetsam / OOM /
+ * wasm32 / `maxStorageBufferBindingSize` ceilings.
  */
 export function assessModelMemoryRisk(
   model: ModelSpec,
-  resolved: Pick<ResolvedDtype, 'dtype' | 'effectiveWeightsBytes'>,
+  resolved: Pick<
+    ResolvedDtype,
+    | 'dtype'
+    | 'effectiveWeightsBytes'
+    | 'activeRuntimeWeightsBytes'
+    | 'onDemandEmbedTokens'
+    | 'maxSingleTensorBytes'
+  >,
   device: Pick<DeviceOption, 'backend' | 'limits'> | undefined,
   env?: MemoryRiskEnvironment
 ): MemoryRiskAssessment {
   const ctx = detectMobileDeviceContext(env);
-  const effectiveWeightsBytes =
+  const fullEffectiveWeightsBytes =
     resolved.effectiveWeightsBytes ?? model.textOnlyBytesByDtype[resolved.dtype] ?? 0;
+  const hasStreamingRuntime =
+    Boolean(resolved.onDemandEmbedTokens) ||
+    resolved.activeRuntimeWeightsBytes !== undefined;
+  const activeWeightsBytes =
+    resolved.activeRuntimeWeightsBytes ?? fullEffectiveWeightsBytes;
+
   const estimatedRuntimeBytes = estimateModelMemoryBytes(
     model,
     resolved.dtype,
     DEFAULT_CONTEXT_TOKENS,
-    effectiveWeightsBytes
+    activeWeightsBytes
   );
-  const estimatedLoadPeakBytes = Math.round(
-    effectiveWeightsBytes * 1.55 +
-      Math.max(MIN_RUNTIME_OVERHEAD_BYTES, effectiveWeightsBytes * 0.15) +
-      Math.max(0, model.tokenizerBytes)
-  );
+  const estimatedLoadPeakBytes = hasStreamingRuntime
+    ? Math.round(
+        activeWeightsBytes * 1.18 +
+          Math.max(
+            resolved.maxSingleTensorBytes ?? 0,
+            MIN_RUNTIME_OVERHEAD_BYTES,
+            activeWeightsBytes * 0.15
+          ) +
+          Math.max(0, model.tokenizerBytes)
+      )
+    : Math.round(
+        fullEffectiveWeightsBytes * 1.55 +
+          Math.max(MIN_RUNTIME_OVERHEAD_BYTES, fullEffectiveWeightsBytes * 0.15) +
+          Math.max(0, model.tokenizerBytes)
+      );
+
+  // 0. WebGPU single-tensor buffer size ceiling (`maxStorageBufferBindingSize` / `maxBufferSize`)
+  if (
+    device?.backend === 'webgpu' &&
+    typeof resolved.maxSingleTensorBytes === 'number' &&
+    Number.isFinite(resolved.maxSingleTensorBytes) &&
+    resolved.maxSingleTensorBytes > 0
+  ) {
+    const candidateLimits = [
+      device.limits?.maxStorageBufferBindingSize,
+      device.limits?.maxBufferSize,
+    ].filter((val): val is number => typeof val === 'number' && Number.isFinite(val) && val > 0);
+    if (candidateLimits.length > 0) {
+      const effectiveGpuLimit = Math.min(...candidateLimits);
+      if (resolved.maxSingleTensorBytes > effectiveGpuLimit) {
+        return {
+          level: 'high',
+          isMobile: ctx.isMobile,
+          estimatedRuntimeBytes,
+          estimatedLoadPeakBytes,
+          estimatedTabBudgetBytes: effectiveGpuLimit,
+          headline: `選択中の WebGPU デバイスの単一バッファ上限 (${formatBytes(effectiveGpuLimit)}) が ${model.name} (${resolved.dtype}) の最大テンソル (${formatBytes(resolved.maxSingleTensorBytes)}) より小さいためロードに失敗する可能性が高いです。`,
+          detail:
+            'CPU (WASM) デバイスへ切り替えるか、単一テンソルが小さい「Qwen 3.5 0.8B」(約 121.3 MiB) や「Gemma 4 E2B」(約 192 MiB) を選択してください。',
+        };
+      }
+    }
+  }
 
   // 1. CPU/WASM 32-bit linear address space ceiling (~3.2–4 GiB regardless of desktop/mobile)
   if (device?.backend === 'wasm' && estimatedRuntimeBytes >= WASM32_SAFE_RUNTIME_LIMIT_BYTES) {

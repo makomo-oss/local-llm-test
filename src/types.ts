@@ -130,6 +130,9 @@ export interface ResolvedDtype {
    * (e.g., Llama 3.2 `q8`). Must remain `undefined` otherwise so `config.json`'s
    * per-file external data chunk map is preserved.
    */
+  activeRuntimeWeightsBytes?: number;
+  onDemandEmbedTokens?: boolean;
+  maxSingleTensorBytes?: number;
   useExternalDataFormat?: true;
   adjusted: boolean;
   reason?: string;

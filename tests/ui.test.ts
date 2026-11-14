@@ -836,7 +836,8 @@ describe('viewTemplates & SVG comparison charts', () => {
       cacheMap: new Map(),
       resolveDtypeFn: resolveEffectiveDtype,
     });
-    expect(wasmHtml).toContain('967.1 MiB');
+    expect(wasmHtml).toContain('622.3 MiB');
+    expect(wasmHtml).not.toContain('967.1 MiB');
     expect(wasmHtml).not.toContain('637.5 MiB');
   });
 
@@ -1382,12 +1383,13 @@ describe('DebouncedLiveAnnouncer & AppController integration', () => {
     deviceSelect.dispatchEvent(new FakeEvent('change'));
 
     const previewHtml = root.querySelector('#dtype-preview-box')!.innerHTML;
-    expect(previewHtml).toContain('967.1 MiB');
+    expect(previewHtml).toContain('622.3 MiB');
+    expect(previewHtml).not.toContain('967.1 MiB');
     expect(previewHtml).not.toContain('637.5 MiB');
-    expect(root.querySelector('#model-list')!.innerHTML).toContain('967.1 MiB');
+    expect(root.querySelector('#model-list')!.innerHTML).toContain('622.3 MiB');
 
     const loadPromise = controller.handleLoadModel();
-    expect(root.querySelector('#load-progress-slot')!.innerHTML).toContain('0 B / 967.1 MiB');
+    expect(root.querySelector('#load-progress-slot')!.innerHTML).toContain('0 B / 622.3 MiB');
 
     resolveLoad();
     await loadPromise;

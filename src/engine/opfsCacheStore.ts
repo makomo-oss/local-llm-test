@@ -5,6 +5,8 @@ export const OPFS_PERSISTENT_THRESHOLD_BYTES = 4 * 1024 * 1024; // 4 MiB
 
 export interface OpfsSyncAccessHandleLike {
   write(buffer: ArrayBufferView | ArrayBuffer, options?: { at?: number }): number;
+  read?(buffer: ArrayBufferView | ArrayBuffer, options?: { at?: number }): number;
+  getSize?(): number;
   flush(): void;
   close(): void;
   truncate?(newSize: number): void;
@@ -204,13 +206,23 @@ async function readOpfsMetaFile(
   }
 }
 
-/**
- * Look up a validated OPFS entry and return a lazy Blob/File-backed `Response`.
- */
-export async function readOpfsCachedResponse(
+export interface OpfsValidatedCachedFile {
+  dir: OpfsDirectoryLike;
+  meta: OpfsStoredEntryMeta;
+  fileHandle: OpfsFileHandleLike;
+  binFile: File | Blob;
+}
+
+export interface OpfsSyncReadHandle {
+  byteLength: number;
+  readAt(dest: Uint8Array, offset: number): number;
+  close(): void;
+}
+
+async function resolveValidatedOpfsEntry(
   opfsRoot: OpfsDirectoryLike | null | undefined,
   url: string
-): Promise<Response | undefined> {
+): Promise<OpfsValidatedCachedFile | undefined> {
   if (!isPersistentOpfsCapable(opfsRoot)) {
     return undefined;
   }
@@ -228,26 +240,113 @@ export async function readOpfsCachedResponse(
   }
 
   try {
-    const binHandle = await dir.getFileHandle(binName, { create: false });
-    const binFile = await binHandle.getFile();
+    const fileHandle = await dir.getFileHandle(binName, { create: false });
+    const binFile = await fileHandle.getFile();
     if (!binFile || binFile.size <= 0 || binFile.size !== meta.byteLength) {
       await removeEntryQuietly(dir, metaName);
       await removeEntryQuietly(dir, binName);
       return undefined;
     }
-    const headers = new Headers(meta.headers);
-    if (!headers.has('content-length')) {
-      headers.set('content-length', String(meta.byteLength));
-    }
-    return new Response(binFile, {
-      status: 200,
-      statusText: 'OK',
-      headers,
-    });
+    return { dir, meta, fileHandle, binFile };
   } catch {
     await removeEntryQuietly(dir, metaName);
     return undefined;
   }
+}
+
+/**
+ * Open a validated persistent OPFS entry without wrapping it in a `Response`.
+ * Useful for on-demand byte-range `Blob.slice` reads.
+ */
+export async function openOpfsCachedBlob(
+  opfsRoot: OpfsDirectoryLike | null | undefined,
+  url: string
+): Promise<Blob | undefined> {
+  const entry = await resolveValidatedOpfsEntry(opfsRoot, url);
+  return entry?.binFile;
+}
+
+/**
+ * Open a synchronous OPFS `FileSystemSyncAccessHandle` reader inside Dedicated Workers.
+ * Returns `undefined` when unavailable (e.g. non-worker contexts, missing entry, or no `.read`).
+ */
+export async function openOpfsSyncReadHandle(
+  opfsRoot: OpfsDirectoryLike | null | undefined,
+  url: string
+): Promise<OpfsSyncReadHandle | undefined> {
+  const entry = await resolveValidatedOpfsEntry(opfsRoot, url);
+  if (!entry || typeof entry.fileHandle.createSyncAccessHandle !== 'function') {
+    return undefined;
+  }
+
+  let accessHandle: OpfsSyncAccessHandleLike | null = null;
+  try {
+    accessHandle = await entry.fileHandle.createSyncAccessHandle();
+    if (typeof accessHandle.read !== 'function') {
+      accessHandle.close();
+      return undefined;
+    }
+    const readFn = accessHandle.read.bind(accessHandle);
+    const totalSize =
+      typeof accessHandle.getSize === 'function' ? accessHandle.getSize() : entry.meta.byteLength;
+    if (!Number.isFinite(totalSize) || totalSize !== entry.meta.byteLength) {
+      accessHandle.close();
+      return undefined;
+    }
+
+    let closed = false;
+    return {
+      byteLength: totalSize,
+      readAt(dest: Uint8Array, offset: number): number {
+        if (closed) {
+          throw new Error(`OPFS SyncAccessHandle is already closed for ${url}`);
+        }
+        return readFn(dest, { at: offset });
+      },
+      close(): void {
+        if (closed || !accessHandle) {
+          return;
+        }
+        closed = true;
+        try {
+          accessHandle.close();
+        } catch {
+          // Ignore close errors during teardown
+        }
+      },
+    };
+  } catch {
+    if (accessHandle) {
+      try {
+        accessHandle.close();
+      } catch {
+        // Ignore close errors
+      }
+    }
+    return undefined;
+  }
+}
+
+/**
+ * Look up a validated OPFS entry and return a lazy Blob/File-backed `Response`.
+ */
+export async function readOpfsCachedResponse(
+  opfsRoot: OpfsDirectoryLike | null | undefined,
+  url: string
+): Promise<Response | undefined> {
+  const entry = await resolveValidatedOpfsEntry(opfsRoot, url);
+  if (!entry) {
+    return undefined;
+  }
+  const headers = new Headers(entry.meta.headers);
+  if (!headers.has('content-length')) {
+    headers.set('content-length', String(entry.meta.byteLength));
+  }
+  return new Response(entry.binFile, {
+    status: 200,
+    statusText: 'OK',
+    headers,
+  });
 }
 
 /**

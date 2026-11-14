@@ -167,18 +167,24 @@ describe('resolveEffectiveDtype', () => {
     const gemma = getModelById('gemma-4-e2b');
 
     const withFp16 = resolveEffectiveDtype(gemma, gpuFp16);
-    expect(withFp16).toEqual({
+    expect(withFp16).toMatchObject({
       dtype: 'q4f16',
       requestedDtype: undefined,
       adjusted: false,
+      onDemandEmbedTokens: true,
+      activeRuntimeWeightsBytes: 1_520_374_223,
+      maxSingleTensorBytes: 201_326_592,
     });
     expect(withFp16.useExternalDataFormat).toBeUndefined();
 
     const withoutFp16 = resolveEffectiveDtype(gemma, gpuNoFp16);
-    expect(withoutFp16).toEqual({
+    expect(withoutFp16).toMatchObject({
       dtype: 'q4',
       requestedDtype: undefined,
       adjusted: false,
+      onDemandEmbedTokens: true,
+      activeRuntimeWeightsBytes: 1_864_750_511,
+      maxSingleTensorBytes: 201_326_592,
     });
 
     const explicitFallback = resolveEffectiveDtype(gemma, gpuNoFp16, 'q4f16');
@@ -202,74 +208,110 @@ describe('resolveEffectiveDtype', () => {
     expect(autoOnQwenWasm).toMatchObject({
       dtype: 'q4',
       modelDtype: {
-        embed_tokens: 'fp16',
+        embed_tokens: 'q4f16',
         decoder_model_merged: 'q4',
       },
-      effectiveWeightsBytes: 994_861_508,
+      effectiveWeightsBytes: 633_308_015,
+      activeRuntimeWeightsBytes: 486_301_511,
+      onDemandEmbedTokens: true,
       requestedDtype: undefined,
       adjusted: true,
     });
-    expect(autoOnQwenWasm.reason).toContain('GatherBlockQuantized');
+    expect(autoOnQwenWasm.reason).toContain('embed_tokens=q4f16');
     expect(getResolvedDownloadBytes(qwen08, autoOnQwenWasm, true)).toBe(
-      994_861_508 + qwen08.tokenizerBytes
+      633_308_015 + qwen08.tokenizerBytes
     );
 
     const q4f16OnWasm = resolveEffectiveDtype(qwen08, wasmCpu, 'q4f16');
     expect(q4f16OnWasm.dtype).toBe('q4');
     expect(q4f16OnWasm.modelDtype).toEqual({
-      embed_tokens: 'fp16',
+      embed_tokens: 'q4f16',
       decoder_model_merged: 'q4',
     });
     expect(q4f16OnWasm.adjusted).toBe(true);
     expect(q4f16OnWasm.reason).toContain('q4f16');
-    expect(q4f16OnWasm.reason).toContain('GatherBlockQuantized');
 
     const q8OnQwenWasm = resolveEffectiveDtype(qwen08, wasmCpu, 'q8');
     expect(q8OnQwenWasm).toMatchObject({
       dtype: 'q8',
       modelDtype: {
-        embed_tokens: 'fp16',
+        embed_tokens: 'q4f16',
         decoder_model_merged: 'q8',
       },
-      effectiveWeightsBytes: 1_382_561_723,
+      effectiveWeightsBytes: 1_021_008_230,
+      activeRuntimeWeightsBytes: 874_001_726,
+      onDemandEmbedTokens: true,
       requestedDtype: 'q8',
       adjusted: true,
     });
 
     expect(resolveEffectiveDtype(qwen2, wasmCpu, 'q4')).toMatchObject({
       dtype: 'q4',
-      modelDtype: { embed_tokens: 'fp16', decoder_model_merged: 'q4' },
-      effectiveWeightsBytes: 2_227_132_252,
+      modelDtype: { embed_tokens: 'q4f16', decoder_model_merged: 'q4' },
+      effectiveWeightsBytes: 1_504_024_838,
+      activeRuntimeWeightsBytes: 1_210_012_894,
     });
     expect(resolveEffectiveDtype(qwen4, wasmCpu, 'q4')).toMatchObject({
       dtype: 'q4',
-      modelDtype: { embed_tokens: 'fp16', decoder_model_merged: 'q4' },
-      effectiveWeightsBytes: 3_973_272_655,
+      modelDtype: { embed_tokens: 'q4f16', decoder_model_merged: 'q4' },
+      effectiveWeightsBytes: 3_069_388_281,
+      activeRuntimeWeightsBytes: 2_701_873_617,
     });
 
     const gemmaE2bWasm = resolveEffectiveDtype(gemmaE2b, wasmCpu, 'q4');
     expect(gemmaE2bWasm).toMatchObject({
       dtype: 'q4',
       modelDtype: {
-        embed_tokens: 'fp32',
+        embed_tokens: 'q4f16',
         decoder_model_merged: 'q4',
       },
-      effectiveWeightsBytes: 12_870_608_450,
+      effectiveWeightsBytes: 3_455_445_924,
+      activeRuntimeWeightsBytes: 1_864_750_511,
+      onDemandEmbedTokens: true,
       adjusted: true,
     });
     expect(resolveEffectiveDtype(gemmaE4b, wasmCpu, 'q8')).toMatchObject({
       dtype: 'q8',
       modelDtype: {
-        embed_tokens: 'fp32',
+        embed_tokens: 'q4f16',
         decoder_model_merged: 'q8',
       },
-      effectiveWeightsBytes: 19_733_881_713,
+      effectiveWeightsBytes: 7_792_699_603,
+      activeRuntimeWeightsBytes: 5_775_233_760,
+      onDemandEmbedTokens: true,
       adjusted: true,
+    });
+
+    // Legacy opt-out preserves non-quantized embed_tokens fallback for ORT WASM without interception
+    const legacyQwenWasm = resolveEffectiveDtype(qwen08, wasmCpu, 'q4', {
+      onDemandEmbedTokens: false,
+    });
+    expect(legacyQwenWasm).toMatchObject({
+      dtype: 'q4',
+      modelDtype: { embed_tokens: 'fp16', decoder_model_merged: 'q4' },
+      effectiveWeightsBytes: 994_861_508,
+      activeRuntimeWeightsBytes: 994_861_508,
+      onDemandEmbedTokens: false,
+      adjusted: true,
+    });
+    expect(legacyQwenWasm.reason).toContain('GatherBlockQuantized');
+    const legacyGemmaE2bWasm = resolveEffectiveDtype(gemmaE2b, wasmCpu, 'q4', {
+      onDemandEmbedTokens: false,
+    });
+    expect(legacyGemmaE2bWasm).toMatchObject({
+      dtype: 'q4',
+      modelDtype: { embed_tokens: 'fp32', decoder_model_merged: 'q4' },
+      effectiveWeightsBytes: 12_870_608_450,
+      onDemandEmbedTokens: false,
     });
 
     // WebGPU keeps scalar dtype with no WASM embed_tokens override
     expect(resolveEffectiveDtype(qwen08, gpuFp16, 'q4f16').modelDtype).toBeUndefined();
     expect(resolveEffectiveDtype(gemmaE2b, gpuFp16, 'q4').modelDtype).toBeUndefined();
+    expect(
+      resolveEffectiveDtype(gemmaE2b, gpuFp16, 'q4f16', { onDemandEmbedTokens: false })
+        .maxSingleTensorBytes
+    ).toBe(1_174_405_120);
   });
 
   it('guards against the Llama 3.2 3B q8 external-data trap unless explicitly opted in', () => {
@@ -296,6 +338,7 @@ describe('resolveEffectiveDtype', () => {
     });
     expect(llamaQ8OptIn).toEqual({
       dtype: 'q8',
+      activeRuntimeWeightsBytes: 3_214_399_024,
       requestedDtype: 'q8',
       useExternalDataFormat: true,
       adjusted: false,

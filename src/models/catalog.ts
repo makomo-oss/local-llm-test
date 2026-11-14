@@ -250,13 +250,103 @@ interface WasmSplitModelWeightSpec {
 }
 
 /**
- * Per-session ONNX overrides for split causal-LM models on CPU (WASM).
- *
- * Qwen 3.5 and Gemma 4 emit `GatherBlockQuantized(1)` inside `embed_tokens_q4.onnx`
- * and `embed_tokens_quantized.onnx`, which ONNX Runtime WASM CPU does not implement
- * (`ERROR_CODE: 9`). `decoder_model_merged` uses `MatMulNBits` + `Gather` cleanly.
- * - Qwen 3.5 uses `embed_tokens_fp16.onnx` (`Gather` + `Cast` -> float32), halving RAM/disk vs `fp32`.
- * - Gemma 4 uses `embed_tokens.onnx` (`fp32`) to avoid FP16 `Mul` ops inside `embed_tokens_fp16.onnx`.
+ * Verified `onnx/embed_tokens_q4f16.onnx` (+ `.onnx_data*`) byte sizes used when
+ * streaming embeddings on demand instead of allocating multi-GiB tables upfront.
+ */
+const EMBED_Q4F16_BYTES_BY_MODEL: Partial<Record<ModelId, number>> = {
+  'qwen-3.5-0.8b': 147_006_504,
+  'qwen-3.5-2b': 294_011_944,
+  'qwen-3.5-4b': 367_514_664,
+  'gemma-4-e2b': 1_590_695_413,
+  'gemma-4-e4b': 2_017_465_843,
+};
+
+/**
+ * Verified per-dtype `onnx/decoder_model_merged*.onnx` (+ `.onnx_data*`) byte sizes.
+ * Represents active ORT/GPU session weights when `embed_tokens` is offloaded to
+ * on-demand row streaming.
+ */
+const DECODER_WEIGHTS_BY_MODEL: Partial<Record<ModelId, Record<QuantDtype, number>>> = {
+  'qwen-3.5-0.8b': {
+    q4f16: 437_699_170,
+    q4: 486_301_511,
+    q8: 874_001_726,
+    fp16: 1_506_711_043,
+  },
+  'qwen-3.5-2b': {
+    q4f16: 1_090_824_102,
+    q4: 1_210_012_894,
+    q8: 2_180_054_057,
+    fp16: 3_765_675_847,
+  },
+  'qwen-3.5-4b': {
+    q4f16: 2_436_142_891,
+    q4: 2_701_873_617,
+    q8: 4_869_975_241,
+    fp16: 8_414_706_270,
+  },
+  'gemma-4-e2b': {
+    q4f16: 1_520_374_223,
+    q4: 1_864_750_511,
+    q8: 3_040_111_074,
+    fp16: 4_761_376_516,
+  },
+  'gemma-4-e4b': {
+    q4f16: 2_888_016_562,
+    q4: 3_380_723_437,
+    q8: 5_775_233_760,
+    fp16: 9_490_880_650,
+  },
+};
+
+/**
+ * Verified largest single tensor byte size uploaded to ORT/WebGPU when on-demand
+ * `embed_tokens` streaming is enabled (i.e. `decoder_model_merged` / `model` max tensor).
+ */
+const MAX_SINGLE_TENSOR_BYTES_BY_MODEL: Partial<
+  Record<ModelId, Partial<Record<QuantDtype, number>>>
+> = {
+  'qwen-3.5-0.8b': {
+    q4f16: 127_139_840,
+    q4: 127_139_840,
+  },
+  'qwen-3.5-2b': {
+    q4f16: 254_279_680,
+    q4: 254_279_680,
+  },
+  'qwen-3.5-4b': {
+    q4f16: 317_849_600,
+    q4: 317_849_600,
+  },
+  'gemma-4-e2b': {
+    q4f16: 201_326_592,
+    q4: 201_326_592,
+  },
+  'gemma-4-e4b': {
+    q4f16: 335_544_320,
+    q4: 335_544_320,
+  },
+  'llama-3.2-3b': {
+    q4f16: 788_004_864,
+    q4: 1_576_009_728,
+    q8: 394_002_432,
+    fp16: 788_004_864,
+  },
+};
+
+/**
+ * Legacy single-tensor max byte sizes when `embed_tokens` is NOT offloaded and
+ * therefore uploaded directly into WebGPU (`embed_tokens_q4f16` per-layer table).
+ */
+const LEGACY_EMBED_MAX_SINGLE_TENSOR_BYTES_BY_MODEL: Partial<Record<ModelId, number>> = {
+  'gemma-4-e2b': 1_174_405_120,
+  'gemma-4-e4b': 1_344 * 1024 * 1024,
+};
+
+/**
+ * Legacy per-session ONNX overrides when `onDemandEmbedTokens` is disabled.
+ * Keeps `embed_tokens` on `fp16` (Qwen) / `fp32` (Gemma) to avoid ORT WASM's
+ * missing `GatherBlockQuantized` kernel at high RAM/download cost.
  */
 const WASM_SPLIT_MODEL_WEIGHTS: Partial<Record<ModelId, WasmSplitModelWeightSpec>> = {
   'qwen-3.5-0.8b': {
@@ -306,16 +396,41 @@ function finalizeWasmDtype(
   decoderDtype: 'q4' | 'q8',
   requestedDtype: QuantDtype | 'auto' | undefined,
   fallbackReason?: string,
-  useExternalDataFormat?: true
+  useExternalDataFormat?: true,
+  onDemandEmbedTokens = true
 ): ResolvedDtype {
   const splitSpec = WASM_SPLIT_MODEL_WEIGHTS[model.id];
-  if (!splitSpec) {
+  const decoderWeights = DECODER_WEIGHTS_BY_MODEL[model.id];
+  const embedQ4f16Bytes = EMBED_Q4F16_BYTES_BY_MODEL[model.id];
+
+  if (!splitSpec || !decoderWeights || embedQ4f16Bytes === undefined) {
     return {
       dtype: decoderDtype,
+      activeRuntimeWeightsBytes: model.textOnlyBytesByDtype[decoderDtype],
       requestedDtype,
       ...(useExternalDataFormat ? { useExternalDataFormat } : {}),
       adjusted: Boolean(fallbackReason),
       ...(fallbackReason ? { reason: fallbackReason } : {}),
+    };
+  }
+
+  if (onDemandEmbedTokens) {
+    const decoderBytes = decoderWeights[decoderDtype];
+    const effectiveWeightsBytes = embedQ4f16Bytes + decoderBytes;
+    const splitReason = `WASM (CPU) では embed_tokens=q4f16 をオンデマンドストリーミング実行し、decoder_model_merged=${decoderDtype} のみをメモリ展開します。`;
+
+    return {
+      dtype: decoderDtype,
+      modelDtype: {
+        embed_tokens: 'q4f16',
+        decoder_model_merged: decoderDtype,
+      },
+      effectiveWeightsBytes,
+      activeRuntimeWeightsBytes: decoderBytes,
+      onDemandEmbedTokens: true,
+      requestedDtype,
+      adjusted: true,
+      reason: fallbackReason ? `${fallbackReason} ${splitReason}` : splitReason,
     };
   }
 
@@ -330,9 +445,67 @@ function finalizeWasmDtype(
       decoder_model_merged: decoderDtype,
     },
     effectiveWeightsBytes,
+    activeRuntimeWeightsBytes: effectiveWeightsBytes,
+    onDemandEmbedTokens: false,
     requestedDtype,
     adjusted: true,
     reason: fallbackReason ? `${fallbackReason} ${splitReason}` : splitReason,
+  };
+}
+
+function finalizeWebGpuDtype(
+  model: ModelSpec,
+  resolvedDtype: QuantDtype,
+  requestedDtype: QuantDtype | 'auto' | undefined,
+  adjusted: boolean,
+  reason?: string,
+  useExternalDataFormat?: true,
+  onDemandEmbedTokens = true
+): ResolvedDtype {
+  const decoderWeights = DECODER_WEIGHTS_BY_MODEL[model.id];
+  const isSplitModel = Boolean(decoderWeights);
+
+  if (!isSplitModel) {
+    const maxSingleTensorBytes = MAX_SINGLE_TENSOR_BYTES_BY_MODEL[model.id]?.[resolvedDtype];
+    return {
+      dtype: resolvedDtype,
+      activeRuntimeWeightsBytes: model.textOnlyBytesByDtype[resolvedDtype],
+      ...(maxSingleTensorBytes !== undefined ? { maxSingleTensorBytes } : {}),
+      requestedDtype,
+      ...(useExternalDataFormat ? { useExternalDataFormat } : {}),
+      adjusted,
+      ...(reason ? { reason } : {}),
+    };
+  }
+
+  if (onDemandEmbedTokens) {
+    const decoderBytes = decoderWeights![resolvedDtype];
+    const maxSingleTensorBytes = MAX_SINGLE_TENSOR_BYTES_BY_MODEL[model.id]?.[resolvedDtype];
+    return {
+      dtype: resolvedDtype,
+      activeRuntimeWeightsBytes: decoderBytes,
+      onDemandEmbedTokens: true,
+      ...(maxSingleTensorBytes !== undefined ? { maxSingleTensorBytes } : {}),
+      requestedDtype,
+      ...(useExternalDataFormat ? { useExternalDataFormat } : {}),
+      adjusted,
+      ...(reason ? { reason } : {}),
+    };
+  }
+
+  const fullWeightsBytes = model.textOnlyBytesByDtype[resolvedDtype];
+  const legacyMaxTensor =
+    LEGACY_EMBED_MAX_SINGLE_TENSOR_BYTES_BY_MODEL[model.id] ??
+    MAX_SINGLE_TENSOR_BYTES_BY_MODEL[model.id]?.[resolvedDtype];
+  return {
+    dtype: resolvedDtype,
+    activeRuntimeWeightsBytes: fullWeightsBytes,
+    onDemandEmbedTokens: false,
+    ...(legacyMaxTensor !== undefined ? { maxSingleTensorBytes: legacyMaxTensor } : {}),
+    requestedDtype,
+    ...(useExternalDataFormat ? { useExternalDataFormat } : {}),
+    adjusted,
+    ...(reason ? { reason } : {}),
   };
 }
 
@@ -342,6 +515,11 @@ export interface ResolveDtypeOptions {
    * models whose `config.json` omits `model_quantized.onnx` (Llama 3.2 3B).
    */
   useExternalDataFormat?: boolean;
+  /**
+   * Stream quantized `embed_tokens` rows on demand from OPFS/cache instead of loading
+   * multi-GiB embedding tables into ORT WASM/WebGPU memory. Enabled by default (`true`).
+   */
+  onDemandEmbedTokens?: boolean;
 }
 
 /**
@@ -354,9 +532,9 @@ export interface ResolveDtypeOptions {
  * 3. Llama 3.2 3B `q8` omits `model_quantized.onnx` from `config.json`'s
  *    `use_external_data_format` map; it either sets `useExternalDataFormat: true`
  *    when opted-in or falls back safely (`q4f16` / `q4`).
- * 4. On CPU/WASM, split-session models whose quantized `embed_tokens` contains
- *    `GatherBlockQuantized` (Qwen 3.5, Gemma 4) use a per-session `modelDtype` map
- *    (`embed_tokens: 'fp16' | 'fp32'`, `decoder_model_merged: 'q4' | 'q8'`).
+ * 4. Split-session models (Qwen 3.5, Gemma 4) default to on-demand `embed_tokens`
+ *    streaming (`onDemandEmbedTokens: true`), using `q4f16` embeddings on WASM and
+ *    offloading `embed_tokens` from WebGPU storage buffers so only decoder tensors hit VRAM.
  */
 export function resolveEffectiveDtype(
   model: ModelSpec,
@@ -364,6 +542,7 @@ export function resolveEffectiveDtype(
   requestedDtype?: QuantDtype | 'auto',
   options?: ResolveDtypeOptions
 ): ResolvedDtype {
+  const onDemand = options?.onDemandEmbedTokens !== false;
   const hasShaderF16 =
     device.backend === 'webgpu' &&
     (device.supportsFp16 || device.features.includes('shader-f16'));
@@ -371,13 +550,17 @@ export function resolveEffectiveDtype(
 
   if (!requestedDtype || requestedDtype === 'auto') {
     if (device.backend === 'wasm') {
-      return finalizeWasmDtype(model, 'q4', requestedDtype);
+      return finalizeWasmDtype(model, 'q4', requestedDtype, undefined, undefined, onDemand);
     }
-    return {
-      dtype: webgpuDefault,
+    return finalizeWebGpuDtype(
+      model,
+      webgpuDefault,
       requestedDtype,
-      adjusted: false,
-    };
+      false,
+      undefined,
+      undefined,
+      onDemand
+    );
   }
 
   const candidate: QuantDtype = requestedDtype;
@@ -385,14 +568,24 @@ export function resolveEffectiveDtype(
     const fallback = device.backend === 'wasm' ? 'q4' : webgpuDefault;
     const unsupportedReason = `${model.name} は dtype "${requestedDtype}" に未対応のため ${fallback} にフォールバックしました。`;
     if (device.backend === 'wasm') {
-      return finalizeWasmDtype(model, 'q4', requestedDtype, unsupportedReason);
+      return finalizeWasmDtype(
+        model,
+        'q4',
+        requestedDtype,
+        unsupportedReason,
+        undefined,
+        onDemand
+      );
     }
-    return {
-      dtype: fallback,
+    return finalizeWebGpuDtype(
+      model,
+      fallback,
       requestedDtype,
-      adjusted: true,
-      reason: unsupportedReason,
-    };
+      true,
+      unsupportedReason,
+      undefined,
+      onDemand
+    );
   }
 
   if (device.backend === 'wasm') {
@@ -401,57 +594,66 @@ export function resolveEffectiveDtype(
         model,
         'q4',
         requestedDtype,
-        `WASM (CPU) バックエンドでは ${candidate} を使用できないため q4 にフォールバックしました。`
+        `WASM (CPU) バックエンドでは ${candidate} を使用できないため q4 にフォールバックしました。`,
+        undefined,
+        onDemand
       );
     }
 
     if (candidate === 'q8' && model.requiresExplicitExternalDataForQ8) {
       if (options?.useExternalDataFormat) {
-        return finalizeWasmDtype(model, 'q8', requestedDtype, undefined, true);
+        return finalizeWasmDtype(model, 'q8', requestedDtype, undefined, true, onDemand);
       }
       return finalizeWasmDtype(
         model,
         'q4',
         requestedDtype,
-        `${model.name} の q8 は use_external_data_format: true 指定が必要なため安全な q4 にフォールバックしました。`
+        `${model.name} の q8 は use_external_data_format: true 指定が必要なため安全な q4 にフォールバックしました。`,
+        undefined,
+        onDemand
       );
     }
 
-    return finalizeWasmDtype(model, candidate, requestedDtype);
+    return finalizeWasmDtype(model, candidate, requestedDtype, undefined, undefined, onDemand);
   }
 
   // WebGPU backend
   if ((candidate === 'q4f16' || candidate === 'fp16') && !hasShaderF16) {
-    return {
-      dtype: 'q4',
+    return finalizeWebGpuDtype(
+      model,
+      'q4',
       requestedDtype,
-      adjusted: true,
-      reason: `選択された WebGPU デバイスは shader-f16 に非対応のため ${candidate} から q4 にフォールバックしました。`,
-    };
+      true,
+      `選択された WebGPU デバイスは shader-f16 に非対応のため ${candidate} から q4 にフォールバックしました。`,
+      undefined,
+      onDemand
+    );
   }
 
   if (candidate === 'q8' && model.requiresExplicitExternalDataForQ8) {
     if (options?.useExternalDataFormat) {
-      return {
-        dtype: 'q8',
+      return finalizeWebGpuDtype(
+        model,
+        'q8',
         requestedDtype,
-        useExternalDataFormat: true,
-        adjusted: false,
-      };
+        false,
+        undefined,
+        true,
+        onDemand
+      );
     }
-    return {
-      dtype: webgpuDefault,
+    return finalizeWebGpuDtype(
+      model,
+      webgpuDefault,
       requestedDtype,
-      adjusted: true,
-      reason: `${model.name} の q8 は use_external_data_format: true 指定が必要なため ${webgpuDefault} にフォールバックしました。`,
-    };
+      true,
+      `${model.name} の q8 は use_external_data_format: true 指定が必要なため ${webgpuDefault} にフォールバックしました。`,
+      undefined,
+      onDemand
+    );
   }
 
-  return {
-    dtype: candidate,
-    requestedDtype,
-    adjusted: false,
-  };
+  return finalizeWebGpuDtype(model, candidate, requestedDtype, false, undefined, undefined, onDemand);
 }
 
 export interface FormatBytesOptions {
