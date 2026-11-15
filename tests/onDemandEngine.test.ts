@@ -3,10 +3,13 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createExternalBlobResolver,
   createOnDemandEmbedTokensSession,
+  createRemoteRangeBlob,
   decodeFp16Bits,
+  parseHttpRangeTotalBytes,
   parseOnnxEmbedTokensPlan,
 } from '../src/engine/embedTokensSession.ts';
 import {
+  DEFAULT_RETAINED_SCRATCH_MAX_BYTES,
   ExternalDataScratchPool,
   ExternalDataSessionBridge,
   createSyncAccessExternalDataProxy,
@@ -15,6 +18,7 @@ import {
   assertStorageQuotaForDownload,
   assertWebGpuSingleTensorLimit,
   classifyModelLoadError,
+  resolveQuotaAwareEmbedPlan,
 } from '../src/engine/llm.worker.ts';
 import { createSerializedCacheAdapter } from '../src/engine/modelPrecacher.ts';
 import {
@@ -30,6 +34,7 @@ import {
   SessionLoadCoordinator,
   withSerializedInferenceSessions,
 } from '../src/engine/sessionSerializer.ts';
+import { installWebGpuUploadOptimizer } from '../src/engine/webgpuUploadOptimizer.ts';
 import { getModelById, resolveEffectiveDtype } from '../src/models/catalog.ts';
 import { assessModelMemoryRisk } from '../src/telemetry/systemProbe.ts';
 import type { DeviceOption } from '../src/types.ts';
@@ -1208,5 +1213,293 @@ describe('WebGPU single-tensor limits, streaming risk & WEBGPU_BUFFER_LIMIT erro
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('shares aligned scratch buffer without overwriting trailing 16 weight bytes, trims slabs > threshold, and elides empty GPU submits', () => {
+    const scratchPool = new ExternalDataScratchPool();
+    // Seed large dirty pool buffer (> 8192 bytes) to test both non-zero dirt & post-upload trim
+    const dirtySeed = scratchPool.acquire(16384);
+    dirtySeed.fill(0xaa);
+
+    const exactAlignedData = new Uint8Array(4112); // > 4096 and % 16 === 0
+    for (let i = 0; i < exactAlignedData.length; i += 1) {
+      exactAlignedData[i] = ((i * 7 + 3) & 0xff) || 1;
+    }
+
+    const proxy = createSyncAccessExternalDataProxy(
+      exactAlignedData.byteLength,
+      (dest, offset) => {
+        const n = Math.min(dest.byteLength, exactAlignedData.byteLength - offset);
+        dest.set(exactAlignedData.subarray(offset, offset + n), 0);
+        return n;
+      },
+      { scratchPool }
+    );
+
+    let createEncoderCalls = 0;
+    let submitCalls = 0;
+    const submittedBatches: unknown[][] = [];
+    const uploadedBytes: number[] = [];
+
+    const device = {
+      createBuffer: vi.fn((desc: { size: number; usage: number; label?: string }) => ({
+        size: desc.size,
+        usage: desc.usage,
+        label: desc.label ?? 'dst',
+      })),
+      createCommandEncoder: vi.fn(() => {
+        createEncoderCalls += 1;
+        return {
+          copyBufferToBuffer: vi.fn(),
+          finish: vi.fn(() => ({ kind: 'native-cmd' })),
+        };
+      }),
+      queue: {
+        writeBuffer: vi.fn(
+          (_dst: unknown, _dstOff: number, data: ArrayBufferView | ArrayBuffer, dataOff = 0, len?: number) => {
+            const view =
+              data instanceof ArrayBuffer
+                ? new Uint8Array(data, dataOff, len)
+                : new Uint8Array(data.buffer, data.byteOffset + dataOff, len ?? data.byteLength);
+            for (const b of view) {
+              uploadedBytes.push(b);
+            }
+          }
+        ),
+        submit: vi.fn((cmds: Iterable<unknown>) => {
+          submitCalls += 1;
+          submittedBatches.push([...cmds]);
+        }),
+      },
+    };
+
+    const opt = installWebGpuUploadOptimizer(device, {
+      chunkBytes: 2048,
+      sharedScratchPool: scratchPool,
+      maxRetainedScratchBytes: 8192,
+    });
+
+    // 1. Aligned > 4096 tensor: getMappedRange shares exact ArrayBuffer and preserves last 16 bytes
+    const slice = proxy.subarray(0, 4112);
+    const staging = device.createBuffer({
+      size: 4112,
+      usage: 6,
+      mappedAtCreation: true,
+    } as never) as unknown as {
+      getMappedRange(): ArrayBuffer;
+      unmap(): void;
+      destroy(): void;
+    };
+    const mapped = staging.getMappedRange();
+    expect(mapped).toBe(slice.buffer);
+    new Uint8Array(mapped, 0, slice.byteLength).set(slice);
+    staging.unmap();
+    const enc = device.createCommandEncoder();
+    const dst = device.createBuffer({ size: 4112, usage: 8, label: 'w1' });
+    enc.copyBufferToBuffer(staging, 0, dst, 0, 4112);
+    const cmd = (enc as unknown as { finish(): unknown }).finish();
+    device.queue.submit([cmd]);
+    staging.destroy();
+
+    expect(Uint8Array.from(uploadedBytes)).toEqual(exactAlignedData);
+    // Neither native createCommandEncoder nor native queue.submit was invoked for virtual copy!
+    expect(createEncoderCalls).toBe(0);
+    expect(submitCalls).toBe(0);
+
+    // 2. Unaligned tensor > 8192 triggers immediate trim of the previous 16384-byte slab after upload
+    uploadedBytes.length = 0;
+    const unalignedData = new Uint8Array(8200);
+    for (let i = 0; i < unalignedData.length; i += 1) {
+      unalignedData[i] = (i & 0xfe) | 1;
+    }
+    const uProxy = createSyncAccessExternalDataProxy(
+      unalignedData.byteLength,
+      (dest, offset) => {
+        dest.set(unalignedData.subarray(offset, offset + dest.byteLength), 0);
+        return dest.byteLength;
+      },
+      { scratchPool }
+    );
+    const uSlice = uProxy.subarray(0, 8200);
+    const uStaging = device.createBuffer({
+      size: 8208,
+      usage: 6,
+      mappedAtCreation: true,
+    } as never) as unknown as typeof staging;
+    const uMapped = uStaging.getMappedRange();
+    expect(uMapped).toBe(uSlice.buffer);
+    new Uint8Array(uMapped, 0, 8200).set(uSlice);
+    uStaging.unmap();
+    const enc2 = device.createCommandEncoder();
+    enc2.copyBufferToBuffer(uStaging, 0, dst, 0, 8208);
+    device.queue.submit([(enc2 as unknown as { finish(): unknown }).finish()]);
+    expect(uploadedBytes.slice(0, 8200)).toEqual(Array.from(unalignedData));
+    expect(uploadedBytes.slice(8200)).toEqual(new Array(8).fill(0));
+
+    // After > 8192 tensor finished uploading, slab must have been trimmed (subsequent 64-byte acquire gets a new small buffer)
+    const afterTrim = scratchPool.acquire(64);
+    expect(afterTrim.buffer).not.toBe(uMapped);
+    expect(DEFAULT_RETAINED_SCRATCH_MAX_BYTES).toBe(18 * 1024 * 1024);
+
+    // 3. Mixed batch with a real native encoder command materializes encoder and preserves real submit only
+    const encReal = device.createCommandEncoder();
+    const realCmd = (encReal as unknown as { finish(): unknown }).finish();
+    device.queue.submit([cmd, realCmd]);
+    expect(submitCalls).toBe(1);
+    expect(submittedBatches[0]).toEqual([realCmd]);
+
+    opt.dispose();
+  });
+
+  it('streams remote slices with createRemoteRangeBlob LRU cache and selects quota-aware embed fallback accurately', async () => {
+    expect(parseHttpRangeTotalBytes('bytes 0-0/1590689792')).toBe(1590689792);
+    expect(parseHttpRangeTotalBytes('invalid')).toBeUndefined();
+
+    const fullRemote = new Uint8Array(256);
+    for (let i = 0; i < fullRemote.length; i += 1) {
+      fullRemote[i] = i;
+    }
+
+    const fetchedRanges: string[] = [];
+    const rangeFetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const hdr = new Headers(init?.headers).get('Range') ?? '';
+      fetchedRanges.push(hdr);
+      const m = /^bytes=(\d+)-(\d+)$/.exec(hdr);
+      if (!m) {
+        return new Response(null, { status: 400 });
+      }
+      const start = Number(m[1]);
+      const end = Math.min(fullRemote.length - 1, Number(m[2]));
+      return new Response(fullRemote.subarray(start, end + 1), {
+        status: 206,
+        headers: { 'content-range': `bytes ${start}-${end}/${fullRemote.length}` },
+      });
+    }) as unknown as typeof fetch;
+
+    // Resolver detects HTTP 206 support and returns a Range Blob without downloading all 256 bytes at once
+    const resolver = createExternalBlobResolver({
+      urlByLocation: new Map([
+        ['embed.onnx_data', 'https://huggingface.co/test/resolve/main/onnx/embed.onnx_data'],
+      ]),
+      cacheName: 'empty-cache',
+      cacheStorage: null,
+      fetchFn: rangeFetch,
+    });
+    const resolvedBlob = await resolver('embed.onnx_data');
+    expect(resolvedBlob?.size).toBe(256);
+
+    // Bounded LRU test: 4096-byte pages with 4096-byte cap evicts page 0 when page 1 is loaded
+    const bigRemote = new Uint8Array(8192);
+    for (let i = 0; i < bigRemote.length; i += 1) {
+      bigRemote[i] = (i * 3) & 0xff;
+    }
+    const lruRanges: string[] = [];
+    const lruFetch = vi.fn(async (_u: RequestInfo | URL, init?: RequestInit) => {
+      const hdr = new Headers(init?.headers).get('Range') ?? '';
+      lruRanges.push(hdr);
+      const m = /^bytes=(\d+)-(\d+)$/.exec(hdr)!;
+      const start = Number(m[1]);
+      const end = Math.min(bigRemote.length - 1, Number(m[2]));
+      return new Response(bigRemote.subarray(start, end + 1), {
+        status: 206,
+        headers: { 'content-range': `bytes ${start}-${end}/${bigRemote.length}` },
+      });
+    }) as unknown as typeof fetch;
+    const lruBlob = createRemoteRangeBlob(
+      'https://huggingface.co/test/resolve/main/onnx/embed_lru.onnx_data',
+      bigRemote.length,
+      lruFetch,
+      { blockBytes: 4096, maxCacheBytes: 4096 }
+    );
+    expect(new Uint8Array(await lruBlob.slice(0, 16).arrayBuffer())).toEqual(
+      bigRemote.subarray(0, 16)
+    );
+    // Same page 0 hit should NOT fire another HTTP request
+    expect(new Uint8Array(await lruBlob.slice(100, 116).arrayBuffer())).toEqual(
+      bigRemote.subarray(100, 116)
+    );
+    expect(lruRanges).toEqual(['bytes=0-4095']);
+    // Reading page 1 evicts page 0, so reading page 0 again fetches page 0 once more
+    expect(new Uint8Array(await lruBlob.slice(4096, 4112).arrayBuffer())).toEqual(
+      bigRemote.subarray(4096, 4112)
+    );
+    expect(new Uint8Array(await lruBlob.slice(0, 16).arrayBuffer())).toEqual(
+      bigRemote.subarray(0, 16)
+    );
+    expect(lruRanges).toEqual(['bytes=0-4095', 'bytes=4096-8191', 'bytes=0-4095']);
+
+    fetchedRanges.length = 0;
+    const directRemote = createRemoteRangeBlob(
+      'https://huggingface.co/test/resolve/main/onnx/embed.onnx_data',
+      256,
+      rangeFetch,
+      { blockBytes: 4096, maxCacheBytes: 0 }
+    );
+    const s1 = new Uint8Array(await directRemote.slice(10, 20).arrayBuffer());
+    const sNeg = new Uint8Array(await directRemote.slice(-4).arrayBuffer());
+    const sEmpty = new Uint8Array(await directRemote.slice(50, 50).arrayBuffer());
+    expect(s1).toEqual(fullRemote.subarray(10, 20));
+    expect(sNeg).toEqual(fullRemote.subarray(252));
+    expect(sEmpty.byteLength).toBe(0);
+    expect(fetchedRanges).toEqual(['bytes=10-19', 'bytes=252-255']);
+
+    // Guard against accidental full multi-GiB buffering on remote Range Blob
+    const hugeRemote = createRemoteRangeBlob('https://example.com/huge.bin', 64 * 1024 * 1024, rangeFetch);
+    await expect(hugeRemote.arrayBuffer()).rejects.toThrow(/Refusing to buffer/);
+
+    // Virtualization allowRemoteFallback matches only designated embed_tokens URLs when missing from disk
+    const remoteAdapter = createSerializedCacheAdapter('empty', undefined, {
+      opfsRoot: null,
+      virtualizeExternalData: {
+        allowRemoteFallback: (u) => /embed_tokens[^/]*\.onnx_data/.test(u),
+      },
+    })!;
+    const embedUrl =
+      'https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/onnx/embed_tokens_q4f16.onnx_data';
+    const decoderUrl =
+      'https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/onnx/decoder_model_merged_q4f16.onnx_data';
+    expect((await remoteAdapter.match(embedUrl)) as unknown).toBe(embedUrl);
+    expect(await remoteAdapter.match(decoderUrl)).toBeUndefined();
+
+    // Quota-aware plan falls back to remote Range embed_tokens when quota fits decoder (~2.0 GB) but not embed+decoder (~3.1 GB)
+    const gemmaE2b = getModelById('gemma-4-e2b');
+    const e2bResolved = resolveEffectiveDtype(
+      gemmaE2b,
+      { backend: 'webgpu', supportsFp16: true, features: ['shader-f16'] },
+      'q4f16'
+    );
+    const modelFiles = [
+      'onnx/embed_tokens_q4f16.onnx',
+      'onnx/embed_tokens_q4f16.onnx_data',
+      'onnx/decoder_model_merged_q4f16.onnx',
+      'onnx/decoder_model_merged_q4f16.onnx_data',
+      'tokenizer.json',
+    ];
+    const tightPlan = resolveQuotaAwareEmbedPlan({
+      modelSpec: gemmaE2b,
+      resolved: e2bResolved,
+      modelFiles,
+      availableBytes: 2_000_000_000,
+      cacheInfos: [],
+    });
+    expect(tightPlan.useRemoteEmbedRangeFallback).toBe(true);
+    expect(tightPlan.filesToPrecache).toEqual([
+      'onnx/embed_tokens_q4f16.onnx',
+      'onnx/decoder_model_merged_q4f16.onnx',
+      'onnx/decoder_model_merged_q4f16.onnx_data',
+      'tokenizer.json',
+    ]);
+    expect(tightPlan.notice).toContain('HTTP Range');
+
+    // Too small even for decoder -> throws STORAGE_QUOTA_EXCEEDED
+    expect(() =>
+      resolveQuotaAwareEmbedPlan({
+        modelSpec: gemmaE2b,
+        resolved: e2bResolved,
+        modelFiles,
+        availableBytes: 500_000_000,
+        cacheInfos: [],
+      })
+    ).toThrow(expect.objectContaining({ code: 'STORAGE_QUOTA_EXCEEDED' }));
   });
 });

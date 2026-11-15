@@ -352,9 +352,10 @@ interface ConfigureTransformersOptions {
   coordinator?: SessionLoadCoordinator;
   signal?: AbortSignal;
   externalDataBridge?: ExternalDataSessionBridge;
+  allowRemoteFallback?: (url: string) => boolean;
 }
 
-const EMBED_TOKENS_EXTERNAL_DATA_REGEX =
+export const EMBED_TOKENS_EXTERNAL_DATA_REGEX =
   /(?:^|\/)embed_tokens[^/]*\.onnx_data(?:_\d+)?(?:$|[?#])/i;
 
 function configureTransformersEnvironment(options: ConfigureTransformersOptions = {}): number {
@@ -373,6 +374,9 @@ function configureTransformersEnvironment(options: ConfigureTransformersOptions 
   env.useBrowserCache = true;
   env.useWasmCache = true;
 
+  const hasWorkerFileReaderSync =
+    typeof (globalThis as { FileReaderSync?: unknown }).FileReaderSync === 'function';
+
   const serializedCache = createSerializedCacheAdapter(
     env.cacheKey || TRANSFORMERS_CACHE_NAME,
     undefined,
@@ -383,7 +387,11 @@ function configureTransformersEnvironment(options: ConfigureTransformersOptions 
       ...(options.externalDataBridge
         ? {
             virtualizeExternalData: {
-              allowCacheStorage: (url: string) => EMBED_TOKENS_EXTERNAL_DATA_REGEX.test(url),
+              allowCacheStorage: (url: string) =>
+                hasWorkerFileReaderSync || EMBED_TOKENS_EXTERNAL_DATA_REGEX.test(url),
+              ...(options.allowRemoteFallback
+                ? { allowRemoteFallback: options.allowRemoteFallback }
+                : {}),
               onMatched: (fileName: string, url: string) => {
                 options.externalDataBridge!.registerUrl(fileName, url);
               },
@@ -619,6 +627,72 @@ export function assertStorageQuotaForDownload(
   throw quotaErr;
 }
 
+export interface QuotaAwareDownloadPlan {
+  filesToPrecache: string[];
+  useRemoteEmbedRangeFallback: boolean;
+  notice?: string;
+}
+
+/**
+ * Decide whether tight storage quota can still fit the model by skipping persistent precaching of
+ * `embed_tokens*.onnx_data*` and streaming embedding rows on-demand via HTTP `Range` instead.
+ */
+export function resolveQuotaAwareEmbedPlan(options: {
+  modelSpec: ModelSpec;
+  resolved: ResolvedDtype;
+  modelFiles: readonly string[];
+  availableBytes: number | undefined;
+  cacheInfos: readonly ModelCacheInfo[];
+  models?: readonly ModelSpec[];
+}): QuotaAwareDownloadPlan {
+  const { modelSpec, resolved, modelFiles, availableBytes, cacheInfos, models = MODEL_CATALOG } =
+    options;
+  try {
+    assertStorageQuotaForDownload(modelSpec, resolved, availableBytes, cacheInfos, models);
+    return {
+      filesToPrecache: [...modelFiles],
+      useRemoteEmbedRangeFallback: false,
+    };
+  } catch (quotaErr) {
+    const hasEmbedExternalData = modelFiles.some((f) => EMBED_TOKENS_EXTERNAL_DATA_REGEX.test(f));
+    const decoderBytes = resolved.activeRuntimeWeightsBytes;
+    if (
+      (quotaErr as { code?: unknown })?.code !== 'STORAGE_QUOTA_EXCEEDED' ||
+      resolved.onDemandEmbedTokens === false ||
+      !hasEmbedExternalData ||
+      typeof decoderBytes !== 'number' ||
+      !Number.isFinite(decoderBytes) ||
+      decoderBytes <= 0 ||
+      typeof availableBytes !== 'number' ||
+      !Number.isFinite(availableBytes)
+    ) {
+      throw quotaErr;
+    }
+
+    const nonEmbedTotalBytes = decoderBytes + modelSpec.tokenizerBytes;
+    const targetCachedBytes =
+      cacheInfos.find((entry) => entry.modelId === modelSpec.id)?.cachedBytes ?? 0;
+    const cachedFiles = cacheInfos.find((entry) => entry.modelId === modelSpec.id)?.files ?? [];
+    const embedAlreadyCached = cachedFiles.some(
+      (f) => EMBED_TOKENS_EXTERNAL_DATA_REGEX.test(f.file) && f.bytes > 0
+    );
+    if (embedAlreadyCached) {
+      throw quotaErr;
+    }
+
+    const remainingWithoutEmbed = Math.max(0, nonEmbedTotalBytes - targetCachedBytes);
+    if (availableBytes < remainingWithoutEmbed * 0.9) {
+      throw quotaErr;
+    }
+
+    return {
+      filesToPrecache: modelFiles.filter((f) => !EMBED_TOKENS_EXTERNAL_DATA_REGEX.test(f)),
+      useRemoteEmbedRangeFallback: true,
+      notice: `ストレージ空き容量 (${formatBytes(availableBytes)}) が限られているため、embed_tokens をローカル保存せずオンデマンド HTTP Range 読み込みで実行します。`,
+    };
+  }
+}
+
 function buildWorkerDeviceOption(
   target: WorkerDeviceTarget,
   acquired: AcquiredGpuDevice | null,
@@ -830,6 +904,7 @@ async function handleLoadModel(
   const sessionCoordinator = new SessionLoadCoordinator();
   const loadAbortController = new AbortController();
   const externalDataBridge = new ExternalDataSessionBridge();
+  let allowRemoteEmbedFallback = false;
 
   try {
     await disposeLoadedRuntime();
@@ -846,6 +921,8 @@ async function handleLoadModel(
       coordinator: sessionCoordinator,
       signal: loadAbortController.signal,
       externalDataBridge,
+      allowRemoteFallback: (url: string) =>
+        allowRemoteEmbedFallback && EMBED_TOKENS_EXTERNAL_DATA_REGEX.test(url),
     });
     state.activeThreads = activeThreads;
 
@@ -898,7 +975,7 @@ async function handleLoadModel(
             state.activeStopper.interrupt();
           }
 
-          if (state.gpuDevice === boundDevice) {
+          if (state.gpuDevice === boundDevice && state.busyOperation !== 'load-model') {
             postWorkerMessage({
               type: 'error',
               requestId: state.activeGenerationRequestId ?? 'device-lost',
@@ -999,17 +1076,24 @@ async function handleLoadModel(
         getBrowserStorageEstimate().catch(() => ({})),
         inspectModelCaches(MODEL_CATALOG, { opfsRoot }).catch(() => [] as ModelCacheInfo[]),
       ]);
-      assertStorageQuotaForDownload(
+      const quotaPlan = resolveQuotaAwareEmbedPlan({
         modelSpec,
         resolved,
-        (storageEstimate as { availableBytes?: number }).availableBytes,
-        cacheInfos
-      );
+        modelFiles,
+        availableBytes: (storageEstimate as { availableBytes?: number }).availableBytes,
+        cacheInfos,
+      });
+      allowRemoteEmbedFallback = quotaPlan.useRemoteEmbedRangeFallback;
+      if (quotaPlan.notice) {
+        notices.push(quotaPlan.notice);
+      }
 
-      aggregator.registerExpectedFiles(modelFiles.filter((file) => !isOptionalModelFile(file)));
+      aggregator.registerExpectedFiles(
+        quotaPlan.filesToPrecache.filter((file) => !isOptionalModelFile(file))
+      );
       const precacheResult = await precacheModelFilesSequentially({
         repoId: modelSpec.repoId,
-        files: modelFiles,
+        files: quotaPlan.filesToPrecache,
         cacheName: env.cacheKey || TRANSFORMERS_CACHE_NAME,
         remoteHost: env.remoteHost,
         remotePathTemplate: env.remotePathTemplate,
@@ -1037,9 +1121,10 @@ async function handleLoadModel(
       await yieldToEventLoop(0);
     }
 
-    const baseSessionOptions: Record<string, unknown> = isConstrainedMobile
-      ? { enableCpuMemArena: false, enableMemPattern: false }
-      : {};
+    const baseSessionOptions: Record<string, unknown> =
+      isConstrainedMobile || deviceOption.backend === 'webgpu'
+        ? { enableCpuMemArena: false, enableMemPattern: false }
+        : {};
 
     const modelOptions: PretrainedModelOptions = {
       device: deviceOption.backend,
@@ -1069,7 +1154,9 @@ async function handleLoadModel(
     const useOnDemandEmbed = resolved.onDemandEmbedTokens !== false;
     const webGpuOptimizer =
       deviceOption.backend === 'webgpu' && acquiredGpu
-        ? installWebGpuUploadOptimizer(acquiredGpu.device)
+        ? installWebGpuUploadOptimizer(acquiredGpu.device, {
+            sharedScratchPool: externalDataBridge.getScratchPool(),
+          })
         : null;
 
     try {

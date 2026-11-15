@@ -12,10 +12,22 @@ import {
  * `ArrayBuffer` (released immediately after session init) instead of allocating ~900+
  * multi-MiB temporary `Uint8Array`s totaling 1.5-2.9 GiB of JS heap churn.
  */
+export const DEFAULT_RETAINED_SCRATCH_MAX_BYTES = 18 * 1024 * 1024;
+
+function alignUp16(byteLength: number): number {
+  return Math.ceil(byteLength / 16) * 16;
+}
+
 export class ExternalDataScratchPool {
   private buffer: ArrayBuffer | null = null;
+  private pendingHandoff: {
+    buffer: ArrayBuffer;
+    byteLength: number;
+    alignedSize: number;
+  } | null = null;
 
   acquire(byteLength: number): Uint8Array {
+    this.pendingHandoff = null;
     if (!Number.isFinite(byteLength) || byteLength <= 0) {
       return new Uint8Array(0);
     }
@@ -28,7 +40,41 @@ export class ExternalDataScratchPool {
     return new Uint8Array(this.buffer, 0, len);
   }
 
+  /**
+   * Register the just-filled external-data slice so the WebGPU upload optimizer can
+   * share the same backing ArrayBuffer without allocating a second 192 MiB staging copy.
+   */
+  recordHandoff(buffer: ArrayBuffer, byteLength: number, alignedSize: number): void {
+    if (this.buffer === buffer && alignedSize > 0 && byteLength > 0 && alignedSize >= byteLength) {
+      this.pendingHandoff = { buffer, byteLength, alignedSize };
+    }
+  }
+
+  /**
+   * Consume the last recorded zero-copy handoff only when `alignedSize` matches exactly.
+   */
+  consumeHandoff(alignedSize: number): ArrayBuffer | null {
+    const handoff = this.pendingHandoff;
+    this.pendingHandoff = null;
+    if (!handoff || handoff.alignedSize !== alignedSize || handoff.buffer !== this.buffer) {
+      return null;
+    }
+    return handoff.buffer;
+  }
+
+  /**
+   * Release oversized scratch slabs (> 18 MiB, e.g. 192 MiB lm_head) immediately after upload
+   * while preserving <= 18 MiB slab reuse for normal weight tensors.
+   */
+  trimIfLargerThan(maxRetainedBytes = DEFAULT_RETAINED_SCRATCH_MAX_BYTES): void {
+    if (this.buffer && this.buffer.byteLength > maxRetainedBytes) {
+      this.buffer = null;
+      this.pendingHandoff = null;
+    }
+  }
+
   release(): void {
+    this.pendingHandoff = null;
     this.buffer = null;
   }
 }
@@ -87,7 +133,9 @@ export function createSyncAccessExternalDataProxy(
           return new Uint8Array(0);
         }
 
-        const out = scratchPool ? scratchPool.acquire(sliceLen) : new Uint8Array(sliceLen);
+        const alignedSize = alignUp16(sliceLen);
+        const backing = scratchPool ? scratchPool.acquire(alignedSize) : new Uint8Array(sliceLen);
+        const out = backing.length === sliceLen ? backing : backing.subarray(0, sliceLen);
         let filled = 0;
         while (filled < sliceLen) {
           const target = filled === 0 ? out : out.subarray(filled);
@@ -99,7 +147,17 @@ export function createSyncAccessExternalDataProxy(
           }
           filled += bytesRead;
         }
-        return filled === sliceLen ? out : out.subarray(0, filled);
+        const result = filled === sliceLen ? out : out.subarray(0, filled);
+        if (scratchPool && filled === sliceLen) {
+          if (alignedSize > sliceLen) {
+            // Zero only trailing 16-byte WebGPU alignment bytes without touching [0 .. sliceLen).
+            backing.fill(0, sliceLen, alignedSize);
+          }
+          if (backing.buffer instanceof ArrayBuffer) {
+            scratchPool.recordHandoff(backing.buffer, sliceLen, alignedSize);
+          }
+        }
+        return result;
       },
       enumerable: false,
       configurable: true,
@@ -131,6 +189,10 @@ export class ExternalDataSessionBridge {
   private readonly urlByKey = new Map<string, string>();
   private readonly activeHandles = new Set<OpfsSyncReadHandle>();
   private readonly scratchPool = new ExternalDataScratchPool();
+
+  getScratchPool(): ExternalDataScratchPool {
+    return this.scratchPool;
+  }
 
   registerUrl(fileNameOrPath: string, url: string): void {
     const clean = fileNameOrPath.replace(/^\.\//, '');

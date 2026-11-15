@@ -693,9 +693,236 @@ export function parseOnnxEmbedTokensPlan(onnxBytes: Uint8Array): EmbedTokensGrap
 
 export type ResolveExternalBlobFn = (location: string) => Promise<Blob | null>;
 
+const DEFAULT_REMOTE_RANGE_BLOCK_BYTES = 64 * 1024;
+const DEFAULT_REMOTE_RANGE_CACHE_BYTES = 4 * 1024 * 1024;
+const MAX_REMOTE_FULL_BUFFER_BYTES = 32 * 1024 * 1024;
+
+export interface RemoteRangeBlobOptions {
+  blockBytes?: number;
+  maxCacheBytes?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Parse total byte length from an HTTP `Content-Range` response header
+ * (e.g. `bytes 0-0/1590689792` -> `1590689792`).
+ */
+export function parseHttpRangeTotalBytes(contentRange: string | null): number | undefined {
+  if (!contentRange) {
+    return undefined;
+  }
+  const match = /^\s*bytes\s+\d+-\d+\/(\d+)\s*$/i.exec(contentRange);
+  if (!match) {
+    return undefined;
+  }
+  const total = Number.parseInt(match[1]!, 10);
+  return Number.isSafeInteger(total) && total > 0 ? total : undefined;
+}
+
+function clampSliceOffset(offset: number | undefined, size: number, fallback: number): number {
+  if (typeof offset !== 'number' || !Number.isFinite(offset)) {
+    return fallback;
+  }
+  const truncated = Math.trunc(offset);
+  if (truncated < 0) {
+    return Math.max(0, size + truncated);
+  }
+  return Math.min(size, truncated);
+}
+
+/**
+ * Create a lazy HTTP `Range` `Blob` adapter with coalesced 64 KiB read-ahead blocks and a
+ * strict 4 MiB LRU cache so on-demand `embed_tokens` inference never downloads a 1.5 GB table.
+ */
+export function createRemoteRangeBlob(
+  url: string,
+  totalSize: number,
+  fetchFn: typeof fetch,
+  options: RemoteRangeBlobOptions = {}
+): Blob {
+  const safeTotal = Math.max(0, Math.floor(totalSize));
+  const blockBytes = Math.max(4096, Math.floor(options.blockBytes ?? DEFAULT_REMOTE_RANGE_BLOCK_BYTES));
+  const maxCacheBytes = Math.max(
+    0,
+    Math.floor(options.maxCacheBytes ?? DEFAULT_REMOTE_RANGE_CACHE_BYTES)
+  );
+  const pageCache = new Map<number, Uint8Array>();
+  const inFlightPages = new Map<number, Promise<Uint8Array>>();
+  let cachedBytes = 0;
+
+  const touchPage = (pageIdx: number): Uint8Array | undefined => {
+    const hit = pageCache.get(pageIdx);
+    if (!hit) {
+      return undefined;
+    }
+    pageCache.delete(pageIdx);
+    pageCache.set(pageIdx, hit);
+    return hit;
+  };
+
+  const putPage = (pageIdx: number, bytes: Uint8Array): void => {
+    if (maxCacheBytes <= 0 || bytes.byteLength > maxCacheBytes) {
+      return;
+    }
+    const existing = pageCache.get(pageIdx);
+    if (existing) {
+      cachedBytes -= existing.byteLength;
+      pageCache.delete(pageIdx);
+    }
+    while (cachedBytes + bytes.byteLength > maxCacheBytes && pageCache.size > 0) {
+      const oldestKey = pageCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldest = pageCache.get(oldestKey);
+      if (oldest) {
+        cachedBytes -= oldest.byteLength;
+      }
+      pageCache.delete(oldestKey);
+    }
+    pageCache.set(pageIdx, bytes);
+    cachedBytes += bytes.byteLength;
+  };
+
+  const fetchRangeBytes = async (start: number, end: number): Promise<Uint8Array> => {
+    const expectedLen = end - start;
+    const resp = await fetchFn(url, {
+      ...(options.signal ? { signal: options.signal } : {}),
+      headers: { Range: `bytes=${start}-${end - 1}` },
+    });
+    if (!resp.ok && resp.status !== 206) {
+      await resp.body?.cancel().catch(() => {});
+      throw new Error(
+        `HTTP Range request failed (${resp.status} ${resp.statusText || 'Error'}) for ${url}`
+      );
+    }
+    const ab = await resp.arrayBuffer();
+    const bytes = new Uint8Array(ab);
+    if (resp.status === 200 && bytes.byteLength >= end) {
+      return bytes.subarray(start, end);
+    }
+    if (bytes.byteLength < expectedLen) {
+      throw new Error(
+        `Short HTTP Range read for ${url}: requested ${expectedLen} bytes [${start}, ${end}), received ${bytes.byteLength}.`
+      );
+    }
+    return bytes.byteLength === expectedLen ? bytes : bytes.subarray(0, expectedLen);
+  };
+
+  const loadBlock = async (pageIdx: number): Promise<Uint8Array> => {
+    const cached = touchPage(pageIdx);
+    if (cached) {
+      return cached;
+    }
+    const pending = inFlightPages.get(pageIdx);
+    if (pending) {
+      return pending;
+    }
+    const pageStart = pageIdx * blockBytes;
+    const pageEnd = Math.min(safeTotal, pageStart + blockBytes);
+    const task = fetchRangeBytes(pageStart, pageEnd)
+      .then((pageBytes) => {
+        const stored =
+          pageBytes.byteOffset === 0 && pageBytes.byteLength === pageBytes.buffer.byteLength
+            ? pageBytes
+            : pageBytes.slice();
+        putPage(pageIdx, stored);
+        return stored;
+      })
+      .finally(() => {
+        inFlightPages.delete(pageIdx);
+      });
+    inFlightPages.set(pageIdx, task);
+    return task;
+  };
+
+  const readSpan = async (start: number, end: number): Promise<ArrayBuffer> => {
+    const len = end - start;
+    if (len <= 0) {
+      return new ArrayBuffer(0);
+    }
+    if (maxCacheBytes <= 0 || len > blockBytes * 2) {
+      const direct = await fetchRangeBytes(start, end);
+      return direct.byteOffset === 0 &&
+        direct.byteLength === direct.buffer.byteLength &&
+        direct.buffer instanceof ArrayBuffer
+        ? direct.buffer
+        : direct.slice().buffer;
+    }
+
+    const firstPage = Math.floor(start / blockBytes);
+    const lastPage = Math.floor((end - 1) / blockBytes);
+    const pages = await Promise.all(
+      Array.from({ length: lastPage - firstPage + 1 }, (_, idx) => loadBlock(firstPage + idx))
+    );
+    const out = new Uint8Array(len);
+    let outPos = 0;
+    for (let i = 0; i < pages.length; i += 1) {
+      const pageIdx = firstPage + i;
+      const pageStart = pageIdx * blockBytes;
+      const pageBytes = pages[i]!;
+      const copyStart = Math.max(start, pageStart);
+      const copyEnd = Math.min(end, pageStart + pageBytes.byteLength);
+      const slice = pageBytes.subarray(copyStart - pageStart, copyEnd - pageStart);
+      out.set(slice, outPos);
+      outPos += slice.byteLength;
+    }
+    return out.buffer;
+  };
+
+  const makeView = (start: number, end: number): Blob => {
+    const clampedStart = clampSliceOffset(start, safeTotal, 0);
+    const clampedEnd = Math.max(clampedStart, clampSliceOffset(end, safeTotal, safeTotal));
+    const viewSize = clampedEnd - clampedStart;
+
+    const blobLike: Blob = {
+      size: viewSize,
+      type: 'application/octet-stream',
+      slice(subStart?: number, subEnd?: number): Blob {
+        const relStart = clampSliceOffset(subStart, viewSize, 0);
+        const relEnd = clampSliceOffset(subEnd, viewSize, viewSize);
+        if (relEnd <= relStart) {
+          return new Blob([], { type: 'application/octet-stream' });
+        }
+        return makeView(clampedStart + relStart, clampedStart + relEnd);
+      },
+      async arrayBuffer(): Promise<ArrayBuffer> {
+        if (viewSize > MAX_REMOTE_FULL_BUFFER_BYTES) {
+          throw new Error(
+            `Refusing to buffer full ${viewSize}-byte remote Range Blob for ${url}; read slices instead.`
+          );
+        }
+        return readSpan(clampedStart, clampedEnd);
+      },
+      async bytes(): Promise<Uint8Array<ArrayBuffer>> {
+        return new Uint8Array(await blobLike.arrayBuffer());
+      },
+      async text(): Promise<string> {
+        return UTF8_DECODER.decode(await blobLike.arrayBuffer());
+      },
+      stream(): ReadableStream<Uint8Array<ArrayBuffer>> {
+        return new ReadableStream<Uint8Array<ArrayBuffer>>({
+          async start(controller) {
+            try {
+              const ab = await blobLike.arrayBuffer();
+              if (ab.byteLength > 0) {
+                controller.enqueue(new Uint8Array(ab));
+              }
+              controller.close();
+            } catch (err) {
+              controller.error(err);
+            }
+          },
+        });
+      },
+    };
+    return blobLike;
+  };
+
+  return makeView(0, safeTotal);
+}
+
 /**
  * Create a browser `Blob` resolver for external `.onnx_data*` locations using OPFS first, then
- * CacheStorage, and finally HTTP fetch if needed.
+ * CacheStorage, and finally HTTP Range streaming (or buffered fetch on non-Range servers).
  */
 export function createExternalBlobResolver(options: {
   urlByLocation: ReadonlyMap<string, string>;
@@ -742,6 +969,23 @@ export function createExternalBlobResolver(options: {
 
     const fetchImpl = options.fetchFn ?? globalThis.fetch;
     if (typeof fetchImpl === 'function') {
+      try {
+        const probeResp = await fetchImpl(url, { headers: { Range: 'bytes=0-0' } });
+        if (probeResp.status === 206) {
+          const totalSize = parseHttpRangeTotalBytes(probeResp.headers.get('content-range'));
+          await probeResp.body?.cancel().catch(() => {});
+          if (typeof totalSize === 'number' && totalSize > 0) {
+            return createRemoteRangeBlob(url, totalSize, fetchImpl);
+          }
+        } else if (probeResp.ok) {
+          return await probeResp.blob();
+        } else {
+          await probeResp.body?.cancel().catch(() => {});
+          return null;
+        }
+      } catch {
+        // Retry once without Range header if a custom fetch implementation rejects init headers
+      }
       try {
         const resp = await fetchImpl(url);
         if (resp.ok) {
