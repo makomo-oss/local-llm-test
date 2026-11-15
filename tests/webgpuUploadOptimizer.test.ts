@@ -308,4 +308,97 @@ describe('webgpuUploadOptimizer', () => {
 
     handle.dispose();
   });
+
+  it('supports elideEmptyCommandEncoders: false without Proxy/submit mutation and captures virtual staging errors', () => {
+    const mock = createMockGpuDevice();
+    const realFinishSpy = vi.fn(() => ({ kind: 'native-empty-cmd' }));
+    const submitSpy = vi.fn();
+    mock.device.createCommandEncoder = vi.fn(() => ({
+      copyBufferToBuffer: vi.fn(),
+      finish: realFinishSpy,
+    }));
+    mock.device.queue.submit = submitSpy;
+
+    const handle = installWebGpuUploadOptimizer(mock.device, {
+      chunkBytes: 8,
+      elideEmptyCommandEncoders: false,
+    });
+    const dst = mock.device.createBuffer({ size: 16, usage: 8, label: 'dst' });
+    const staging = mock.device.createBuffer({ mappedAtCreation: true, size: 16, usage: 6 }) as {
+      getMappedRange(offset?: number, size?: number): ArrayBuffer;
+      unmap(): void;
+      destroy(): void;
+    };
+    const mapped = staging.getMappedRange();
+    new Uint8Array(mapped).set([1, 2, 3, 4]);
+    staging.unmap();
+    const enc = mock.device.createCommandEncoder();
+    enc.copyBufferToBuffer(staging, 0, dst, 0, 16);
+    const cmd = (enc as unknown as { finish(): unknown }).finish();
+    expect(realFinishSpy).toHaveBeenCalledTimes(1);
+    expect(cmd).toEqual({ kind: 'native-empty-cmd' });
+    mock.device.queue.submit([cmd]);
+    expect(submitSpy).toHaveBeenCalledWith([{ kind: 'native-empty-cmd' }]);
+    staging.destroy();
+
+    // Virtual validation errors (unmapped copy / out-of-range getMappedRange) must also be recorded
+    const badStaging = mock.device.createBuffer({ mappedAtCreation: true, size: 16, usage: 6 }) as {
+      getMappedRange(offset?: number, size?: number): ArrayBuffer;
+      unmap(): void;
+      destroy(): void;
+    };
+    expect(() => badStaging.getMappedRange(4, 8)).toThrow(/Unsupported getMappedRange/);
+    expect((handle.getLastError() as Error).message).toContain('Unsupported getMappedRange');
+
+    badStaging.getMappedRange();
+    const badEnc = mock.device.createCommandEncoder();
+    expect(() => badEnc.copyBufferToBuffer(badStaging, 0, dst, 0, 16)).toThrow(/must be unmapped/);
+    expect((handle.getLastError() as Error).message).toContain('must be unmapped');
+    badStaging.destroy();
+
+    handle.dispose();
+  });
+
+  it('supports useVirtualStaging: false passthrough diagnostics and non-writable queue.submit hosts', () => {
+    const mock = createMockGpuDevice();
+    let failNativeMap = false;
+    const origCreate = mock.device.createBuffer;
+    mock.device.createBuffer = (desc) => {
+      const buf = origCreate.call(mock.device, desc) as Record<string, unknown>;
+      if (desc.mappedAtCreation) {
+        buf.getMappedRange = () => {
+          if (failNativeMap) {
+            throw new Error('native Dawn OOM on getMappedRange');
+          }
+          return new ArrayBuffer(desc.size);
+        };
+      }
+      return buf;
+    };
+    // Simulate a frozen / non-writable queue.submit property
+    Object.defineProperty(mock.device.queue, 'submit', {
+      value: vi.fn(),
+      writable: false,
+      configurable: false,
+    });
+
+    const handle = installWebGpuUploadOptimizer(mock.device, {
+      useVirtualStaging: false,
+      elideEmptyCommandEncoders: false,
+    });
+    const dst = mock.device.createBuffer({ size: 16, usage: 8, label: 'dst' });
+    const nativeStaging = mock.device.createBuffer({
+      mappedAtCreation: true,
+      size: 16,
+      usage: 6,
+    }) as { getMappedRange(): ArrayBuffer; unmap(): void; destroy(): void };
+    expect(handle.getStats().interceptCount).toBe(0);
+    failNativeMap = true;
+    expect(() => nativeStaging.getMappedRange()).toThrow('native Dawn OOM on getMappedRange');
+    expect((handle.getLastError() as Error).message).toContain('native Dawn OOM on getMappedRange');
+    mock.device.createCommandEncoder().copyBufferToBuffer(nativeStaging, 0, dst, 0, 16);
+    expect(mock.nativeCopies).toHaveLength(1);
+    nativeStaging.destroy();
+    handle.dispose();
+  });
 });

@@ -65,12 +65,17 @@ import {
   createOnDemandEmbedTokensSession,
   parseOnnxEmbedTokensPlan,
 } from './embedTokensSession.ts';
-import { ExternalDataSessionBridge } from './externalDataProxy.ts';
+import {
+  DEFAULT_RETAINED_SCRATCH_MAX_BYTES,
+  ExternalDataSessionBridge,
+} from './externalDataProxy.ts';
 import { resolveOpfsRootDirectory, type OpfsDirectoryLike } from './opfsCacheStore.ts';
 import { SessionLoadCoordinator, withSerializedInferenceSessions } from './sessionSerializer.ts';
 import {
   installWebGpuUploadOptimizer,
   type WebGpuUploadOptimizerHandle,
+  type WebGpuUploadOptimizerOptions,
+  type WebGpuUploadOptimizerStats,
 } from './webgpuUploadOptimizer.ts';
 
 const TRAILING_SPECIAL_DELIMITER_REGEX =
@@ -478,11 +483,26 @@ function formatWorkerError(err: unknown): string {
   }
 }
 
-export function classifyModelLoadError(err: unknown): { code: string; message: string } {
+export interface ClassifyModelLoadErrorContext {
+  modelId?: string;
+  backend?: ExecutionBackend;
+}
+
+export function classifyModelLoadError(
+  err: unknown,
+  context?: ClassifyModelLoadErrorContext
+): { code: string; message: string } {
   const rawMessage = formatWorkerError(err);
   const explicitCode =
     err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
   const errName = err instanceof Error ? err.name : '';
+  const isSmallestCatalogModel = context?.modelId === 'qwen-3.5-0.8b';
+  const isWasmBackend = context?.backend === 'wasm';
+  const modelSwitchHint = isSmallestCatalogModel
+    ? isWasmBackend
+      ? '他タブを閉じてメモリを確保のうえ再読み込みをお試しください'
+      : 'CPU (WASM) への切替、または他タブを閉じてメモリを確保のうえ再試行してください'
+    : 'CPU (WASM) または Qwen 3.5 0.8B などの軽量モデルへの切替をお試しください';
 
   if (
     explicitCode === 'STORAGE_QUOTA_EXCEEDED' ||
@@ -511,7 +531,7 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
   ) {
     return {
       code: 'WEBGPU_BUFFER_LIMIT',
-      message: `WebGPU デバイスの単一バッファ上限を超えたためモデルの初期化に失敗しました (${rawMessage})。CPU (WASM) への切替、または Qwen 3.5 0.8B などの軽量モデルをお試しください。`,
+      message: `WebGPU デバイスの単一バッファ上限を超えたためモデルの初期化に失敗しました (${rawMessage})。${modelSwitchHint}。`,
     };
   }
 
@@ -519,9 +539,12 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
     explicitCode === 'WEBGPU_DEVICE_LOST' ||
     /WebGPU デバイスが失われました|device is lost|device lost/i.test(rawMessage)
   ) {
+    const lostHint = isSmallestCatalogModel
+      ? 'CPU (WASM SIMD) への切替、または他タブを閉じて再試行してください'
+      : 'CPU (WASM SIMD) またはより軽量なモデルをお試しください';
     return {
       code: 'WEBGPU_DEVICE_LOST',
-      message: `GPU ドライバまたはメモリ制限により WebGPU デバイスがリセットされました (${rawMessage})。CPU (WASM SIMD) またはより軽量なモデルをお試しください。`,
+      message: `GPU ドライバまたはメモリ制限により WebGPU デバイスがリセットされました (${rawMessage})。${lostHint}。`,
     };
   }
 
@@ -530,9 +553,14 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
       rawMessage
     )
   ) {
+    const oomHint = isSmallestCatalogModel
+      ? isWasmBackend
+        ? '他タブを閉じてメモリを確保のうえ再読み込みをお試しください'
+        : '他タブを閉じてメモリを確保するか、CPU (WASM) への切替をお試しください'
+      : 'スマホ・低メモリ環境では Qwen 3.5 0.8B (WebGPU) またはより小さい量子化をお試しください';
     return {
       code: 'OUT_OF_MEMORY',
-      message: `メモリ不足のためモデルの初期化に失敗しました (${rawMessage})。スマホ・低メモリ環境では Qwen 3.5 0.8B (WebGPU) またはより小さい量子化をお試しください。`,
+      message: `メモリ不足のためモデルの初期化に失敗しました (${rawMessage})。${oomHint}。`,
     };
   }
 
@@ -546,7 +574,7 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
   ) {
     return {
       code: 'EXTERNAL_DATA_READ_FAILED',
-      message: `モデルデータの読み込みまたはGPU転送に失敗しました (${rawMessage})。ブラウザのキャッシュ削除後の再読み込み、または CPU (WASM) / Qwen 3.5 0.8B などの軽量モデルへの切替をお試しください。`,
+      message: `モデルデータの読み込みまたはGPU転送に失敗しました (${rawMessage})。ブラウザのキャッシュ削除後の再読み込み、または${modelSwitchHint}。`,
     };
   }
 
@@ -554,6 +582,50 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
     code: 'MODEL_LOAD_FAILED',
     message: `モデルのロードに失敗しました: ${rawMessage}`,
   };
+}
+
+const MAX_PASSTHROUGH_RETRY_UPLOADED_BYTES = 64 * 1024 * 1024;
+
+export interface WebGpuUploadFallbackContext {
+  backend: ExecutionBackend;
+  err: unknown;
+  readFailure: { url: string; offset: number; length: number; error: unknown } | null;
+  deviceLostError: string | null;
+  stats: WebGpuUploadOptimizerStats | null;
+  attemptIndex: number;
+}
+
+/**
+ * Determine whether a synchronous WebGPU upload failure during session creation can safely
+ * retry with a more conservative optimizer configuration (`no-zero-copy` -> `native-passthrough`).
+ */
+export function selectNextWebGpuUploadRetryMode(
+  ctx: WebGpuUploadFallbackContext
+): 'no-zero-copy' | 'native-passthrough' | null {
+  if (ctx.backend !== 'webgpu' || ctx.readFailure || ctx.deviceLostError) {
+    return null;
+  }
+  const msg = formatWorkerError(ctx.err);
+  const looksLikeMemoryCopyFailure =
+    /Unknown error occurred in memory copy|Deserialize tensor .*Failed to load external data file|Virtual WebGPU staging buffer|copyBufferToBuffer|getMappedRange/i.test(
+      msg
+    );
+  if (!looksLikeMemoryCopyFailure) {
+    return null;
+  }
+  if (/out of memory|allocation failed|maxBufferSize|device is lost|device lost/i.test(msg)) {
+    return null;
+  }
+  if (ctx.attemptIndex === 0) {
+    return 'no-zero-copy';
+  }
+  if (
+    ctx.attemptIndex === 1 &&
+    (!ctx.stats || ctx.stats.bytesUploaded <= MAX_PASSTHROUGH_RETRY_UPLOADED_BYTES)
+  ) {
+    return 'native-passthrough';
+  }
+  return null;
 }
 
 /**
@@ -975,6 +1047,8 @@ async function handleLoadModel(
   let acquiredGpu: AcquiredGpuDevice | null = null;
   let loadedModel: PreTrainedModel | null = null;
   let webGpuOptimizer: WebGpuUploadOptimizerHandle | null = null;
+  let lastCapturedUploadError: unknown = null;
+  let activeBackend: ExecutionBackend = req.deviceTarget.backend;
   const sessionCoordinator = new SessionLoadCoordinator();
   const loadAbortController = new AbortController();
   const externalDataBridge = new ExternalDataSessionBridge();
@@ -1226,12 +1300,119 @@ async function handleLoadModel(
 
     const cacheName = env.cacheKey || TRANSFORMERS_CACHE_NAME;
     const useOnDemandEmbed = resolved.onDemandEmbedTokens !== false;
+    activeBackend = deviceOption.backend;
+
+    const createSessionHooks = () => ({
+      interceptCreate: async (modelData: unknown, sessionOptions: unknown) => {
+        if (!useOnDemandEmbed || !(modelData instanceof Uint8Array)) {
+          return null;
+        }
+        const plan = parseOnnxEmbedTokensPlan(modelData);
+        if (!plan) {
+          return null;
+        }
+        const isEmbedSession =
+          plan.outputNames.includes('inputs_embeds') ||
+          plan.externalLocations.some((loc) => /embed_tokens/i.test(loc));
+        if (!isEmbedSession) {
+          return null;
+        }
+
+        const urlByLocation = new Map<string, string>();
+        const inlineBlobs = new Map<string, Blob>();
+        const optsObj =
+          sessionOptions && typeof sessionOptions === 'object'
+            ? (sessionOptions as { externalData?: unknown[] })
+            : undefined;
+        if (Array.isArray(optsObj?.externalData)) {
+          for (const entry of optsObj.externalData) {
+            if (!entry || typeof entry !== 'object') {
+              continue;
+            }
+            const obj = entry as { path?: unknown; data?: unknown };
+            const pathKey = typeof obj.path === 'string' ? obj.path.replace(/^\.\//, '') : '';
+            const baseKey = pathKey ? (pathKey.split('/').pop() ?? pathKey) : '';
+            if (typeof obj.data === 'string' && pathKey) {
+              urlByLocation.set(pathKey, obj.data);
+              if (baseKey) {
+                urlByLocation.set(baseKey, obj.data);
+              }
+            } else if (obj.data instanceof Uint8Array && pathKey) {
+              const blob = new Blob([obj.data as BlobPart]);
+              inlineBlobs.set(pathKey, blob);
+              if (baseKey) {
+                inlineBlobs.set(baseKey, blob);
+              }
+            }
+          }
+        }
+
+        for (const loc of plan.externalLocations) {
+          if (!urlByLocation.has(loc)) {
+            const registered = externalDataBridge.resolveUrl(loc);
+            if (registered) {
+              urlByLocation.set(loc, registered);
+            }
+          }
+        }
+
+        const baseResolveBlob = createExternalBlobResolver({
+          urlByLocation,
+          opfsRoot,
+          cacheName,
+        });
+        return createOnDemandEmbedTokensSession(plan, async (location) => {
+          const clean = location.replace(/^\.\//, '');
+          const base = clean.split('/').pop() ?? clean;
+          const inline =
+            inlineBlobs.get(location) ?? inlineBlobs.get(clean) ?? inlineBlobs.get(base);
+          if (inline) {
+            return inline;
+          }
+          return baseResolveBlob(location);
+        });
+      },
+      prepareExternalData: (options: Record<string, unknown>) =>
+        externalDataBridge.prepareSessionExternalData(options, {
+          opfsRoot,
+          cacheName,
+        }),
+    });
+
+    const optimizerProfiles: WebGpuUploadOptimizerOptions[] =
+      deviceOption.backend === 'webgpu' && acquiredGpu
+        ? [
+            {
+              // Keep native CommandEncoder + real Queue.submit without Proxy/noop wrapping and
+              // reserve zero-copy aliasing strictly for >18 MiB tensors (matches 54308ff safety).
+              sharedScratchPool: externalDataBridge.getScratchPool(),
+              elideEmptyCommandEncoders: false,
+              minZeroCopyHandoffBytes: DEFAULT_RETAINED_SCRATCH_MAX_BYTES,
+              enableZeroCopyHandoff: true,
+              useVirtualStaging: true,
+            },
+            {
+              sharedScratchPool: null,
+              elideEmptyCommandEncoders: false,
+              enableZeroCopyHandoff: false,
+              useVirtualStaging: true,
+            },
+            {
+              sharedScratchPool: null,
+              elideEmptyCommandEncoders: false,
+              enableZeroCopyHandoff: false,
+              useVirtualStaging: false,
+            },
+          ]
+        : [];
+
+    let currentUploadProfileIndex = 0;
+    let activeFallbackRetryMode: 'no-zero-copy' | 'native-passthrough' | null = null;
+    sessionCoordinator.reset();
     externalDataBridge.clearLastReadError();
     webGpuOptimizer =
       deviceOption.backend === 'webgpu' && acquiredGpu
-        ? installWebGpuUploadOptimizer(acquiredGpu.device, {
-            sharedScratchPool: externalDataBridge.getScratchPool(),
-          })
+        ? installWebGpuUploadOptimizer(acquiredGpu.device, optimizerProfiles[currentUploadProfileIndex]!)
         : null;
 
     try {
@@ -1239,83 +1420,51 @@ async function handleLoadModel(
         sessionCoordinator,
         () => AutoModelForCausalLM.from_pretrained(modelSpec.repoId, modelOptions),
         {
-          interceptCreate: async (modelData, sessionOptions) => {
-            if (!useOnDemandEmbed || !(modelData instanceof Uint8Array)) {
-              return null;
+          ...createSessionHooks(),
+          shouldRetryCreate: async (attemptErr) => {
+            if (deviceOption.backend !== 'webgpu' || !acquiredGpu) {
+              return false;
             }
-            const plan = parseOnnxEmbedTokensPlan(modelData);
-            if (!plan) {
-              return null;
-            }
-            const isEmbedSession =
-              plan.outputNames.includes('inputs_embeds') ||
-              plan.externalLocations.some((loc) => /embed_tokens/i.test(loc));
-            if (!isEmbedSession) {
-              return null;
-            }
-
-            const urlByLocation = new Map<string, string>();
-            const inlineBlobs = new Map<string, Blob>();
-            const optsObj =
-              sessionOptions && typeof sessionOptions === 'object'
-                ? (sessionOptions as { externalData?: unknown[] })
-                : undefined;
-            if (Array.isArray(optsObj?.externalData)) {
-              for (const entry of optsObj.externalData) {
-                if (!entry || typeof entry !== 'object') {
-                  continue;
-                }
-                const obj = entry as { path?: unknown; data?: unknown };
-                const pathKey = typeof obj.path === 'string' ? obj.path.replace(/^\.\//, '') : '';
-                const baseKey = pathKey ? (pathKey.split('/').pop() ?? pathKey) : '';
-                if (typeof obj.data === 'string' && pathKey) {
-                  urlByLocation.set(pathKey, obj.data);
-                  if (baseKey) {
-                    urlByLocation.set(baseKey, obj.data);
-                  }
-                } else if (obj.data instanceof Uint8Array && pathKey) {
-                  const blob = new Blob([obj.data as BlobPart]);
-                  inlineBlobs.set(pathKey, blob);
-                  if (baseKey) {
-                    inlineBlobs.set(baseKey, blob);
-                  }
-                }
-              }
-            }
-
-            for (const loc of plan.externalLocations) {
-              if (!urlByLocation.has(loc)) {
-                const registered = externalDataBridge.resolveUrl(loc);
-                if (registered) {
-                  urlByLocation.set(loc, registered);
-                }
-              }
-            }
-
-            const baseResolveBlob = createExternalBlobResolver({
-              urlByLocation,
-              opfsRoot,
-              cacheName,
+            const readErr = externalDataBridge.peekLastReadError();
+            const uploadStats = webGpuOptimizer?.getStats() ?? null;
+            const nextMode = selectNextWebGpuUploadRetryMode({
+              backend: deviceOption.backend,
+              err: attemptErr,
+              readFailure: readErr,
+              deviceLostError: state.deviceLostError,
+              stats: uploadStats,
+              attemptIndex: currentUploadProfileIndex,
             });
-            return createOnDemandEmbedTokensSession(plan, async (location) => {
-              const clean = location.replace(/^\.\//, '');
-              const base = clean.split('/').pop() ?? clean;
-              const inline =
-                inlineBlobs.get(location) ?? inlineBlobs.get(clean) ?? inlineBlobs.get(base);
-              if (inline) {
-                return inline;
-              }
-              return baseResolveBlob(location);
-            });
+            if (!nextMode || currentUploadProfileIndex + 1 >= optimizerProfiles.length) {
+              return false;
+            }
+            const priorUploadErr = webGpuOptimizer?.getLastError();
+            if (priorUploadErr) {
+              lastCapturedUploadError = priorUploadErr;
+            }
+            webGpuOptimizer?.dispose();
+            externalDataBridge.closeAll();
+            currentUploadProfileIndex += 1;
+            activeFallbackRetryMode = nextMode;
+            webGpuOptimizer = installWebGpuUploadOptimizer(
+              acquiredGpu.device,
+              optimizerProfiles[currentUploadProfileIndex]!
+            );
+            await yieldToEventLoop(0);
+            return true;
           },
-          prepareExternalData: (options) =>
-            externalDataBridge.prepareSessionExternalData(options, {
-              opfsRoot,
-              cacheName,
-            }),
         }
       );
+      if (activeFallbackRetryMode === 'no-zero-copy') {
+        notices.push('WebGPU 転送をゼロコピー無効モードへ自動フォールバックして初期化しました。');
+      } else if (activeFallbackRetryMode === 'native-passthrough') {
+        notices.push('WebGPU 転送をネイティブ互換モードへ自動フォールバックして初期化しました。');
+      }
     } finally {
+      const finalUploadErr = webGpuOptimizer?.getLastError();
+      if (finalUploadErr) {
+        lastCapturedUploadError = finalUploadErr;
+      }
       webGpuOptimizer?.dispose();
     }
 
@@ -1365,6 +1514,7 @@ async function handleLoadModel(
       ...(fallbackNotice ? { fallbackNotice } : {}),
     });
   } catch (err) {
+    const capturedDeviceLostError = state.deviceLostError;
     loadAbortController.abort(err);
     sessionCoordinator.abortAll(err);
     if (loadedModel) {
@@ -1377,9 +1527,16 @@ async function handleLoadModel(
     await disposeLoadedRuntime();
 
     const capturedReadError = externalDataBridge.consumeLastReadError();
-    const capturedUploadError = webGpuOptimizer?.getLastError() ?? null;
+    const capturedUploadError =
+      webGpuOptimizer?.getLastError() ??
+      lastCapturedUploadError ??
+      (capturedDeviceLostError ? new Error(capturedDeviceLostError) : null);
     const classified = classifyModelLoadError(
-      enrichModelLoadError(err, capturedReadError, capturedUploadError)
+      enrichModelLoadError(err, capturedReadError, capturedUploadError),
+      {
+        modelId: modelSpec.id,
+        backend: activeBackend,
+      }
     );
     postWorkerMessage({
       type: 'error',

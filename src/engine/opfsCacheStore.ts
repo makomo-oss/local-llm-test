@@ -345,7 +345,7 @@ export async function readStreamChunks(
         if (signal?.aborted) {
           throw new DOMException('Aborted', 'AbortError');
         }
-        if (isDetachedArrayBuffer(staging)) {
+        if (isDetachedArrayBuffer(staging) || staging.byteLength < 4096) {
           staging = new ArrayBuffer(bufferBytes);
         }
         const view = new Uint8Array(staging);

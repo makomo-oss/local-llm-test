@@ -20,6 +20,7 @@ import {
   classifyModelLoadError,
   enrichModelLoadError,
   resolveQuotaAwareEmbedPlan,
+  selectNextWebGpuUploadRetryMode,
 } from '../src/engine/llm.worker.ts';
 import {
   createSerializedCacheAdapter,
@@ -2081,7 +2082,7 @@ describe('Sync external-data reliability, Cache->OPFS migration & Range fallback
     }
   });
 
-  it('enrichModelLoadError + classifyModelLoadError surface swallowed memory-copy root causes cleanly', () => {
+  it('enrichModelLoadError + classifyModelLoadError surface swallowed memory-copy root causes cleanly', async () => {
     const ortMemCopyErr = new Error(
       "Can't create a session. ERROR_CODE: 1, ERROR_MESSAGE: Deserialize tensor model_layers_0_attn_k_proj_MatMul_weight_zp failed.Failed to load external data file \"decoder_model_merged_q4f16.onnx_data\", error: Unknown error occurred in memory copy."
     );
@@ -2111,5 +2112,241 @@ describe('Sync external-data reliability, Cache->OPFS migration & Range fallback
 
     // Un-enriched ORT memory copy error also classifies as EXTERNAL_DATA_READ_FAILED
     expect(classifyModelLoadError(ortMemCopyErr).code).toBe('EXTERNAL_DATA_READ_FAILED');
+
+    // Context-aware hints must NOT recommend switching to Qwen 3.5 0.8B when Qwen 3.5 0.8B itself failed
+    const qwenWebGpuErr = classifyModelLoadError(ortMemCopyErr, {
+      modelId: 'qwen-3.5-0.8b',
+      backend: 'webgpu',
+    });
+    expect(qwenWebGpuErr.code).toBe('EXTERNAL_DATA_READ_FAILED');
+    expect(qwenWebGpuErr.message).toContain('CPU (WASM)');
+    expect(qwenWebGpuErr.message).not.toContain('Qwen 3.5 0.8B');
+
+    const qwenWasmOom = classifyModelLoadError(new Error('bad_alloc OOM'), {
+      modelId: 'qwen-3.5-0.8b',
+      backend: 'wasm',
+    });
+    expect(qwenWasmOom.code).toBe('OUT_OF_MEMORY');
+    expect(qwenWasmOom.message).not.toContain('Qwen 3.5 0.8B');
+
+    // Bounded WebGPU fallback state machine & boundaries
+    expect(
+      selectNextWebGpuUploadRetryMode({
+        backend: 'webgpu',
+        err: ortMemCopyErr,
+        readFailure: null,
+        deviceLostError: null,
+        stats: { interceptCount: 1, chunkWriteCount: 0, bytesUploaded: 0, peakScratchBytes: 0 },
+        attemptIndex: 0,
+      })
+    ).toBe('no-zero-copy');
+    expect(
+      selectNextWebGpuUploadRetryMode({
+        backend: 'webgpu',
+        err: ortMemCopyErr,
+        readFailure: null,
+        deviceLostError: null,
+        stats: {
+          interceptCount: 1,
+          chunkWriteCount: 0,
+          bytesUploaded: 64 * 1024 * 1024,
+          peakScratchBytes: 4096,
+        },
+        attemptIndex: 1,
+      })
+    ).toBe('native-passthrough');
+    expect(
+      selectNextWebGpuUploadRetryMode({
+        backend: 'webgpu',
+        err: ortMemCopyErr,
+        readFailure: null,
+        deviceLostError: null,
+        stats: {
+          interceptCount: 100,
+          chunkWriteCount: 100,
+          bytesUploaded: 64 * 1024 * 1024 + 1,
+          peakScratchBytes: 4096,
+        },
+        attemptIndex: 1,
+      })
+    ).toBeNull();
+    expect(
+      selectNextWebGpuUploadRetryMode({
+        backend: 'webgpu',
+        err: ortMemCopyErr,
+        readFailure: { url: 'u', offset: 0, length: 64, error: notReadable },
+        deviceLostError: null,
+        stats: { interceptCount: 1, chunkWriteCount: 0, bytesUploaded: 0, peakScratchBytes: 0 },
+        attemptIndex: 0,
+      })
+    ).toBeNull();
+    expect(
+      selectNextWebGpuUploadRetryMode({
+        backend: 'webgpu',
+        err: ortMemCopyErr,
+        readFailure: null,
+        deviceLostError: null,
+        stats: {
+          interceptCount: 0,
+          chunkWriteCount: 0,
+          bytesUploaded: 0,
+          peakScratchBytes: 0,
+        },
+        attemptIndex: 1,
+      })
+    ).toBe('native-passthrough');
+    expect(
+      selectNextWebGpuUploadRetryMode({
+        backend: 'wasm',
+        err: ortMemCopyErr,
+        readFailure: null,
+        deviceLostError: null,
+        stats: null,
+        attemptIndex: 0,
+      })
+    ).toBeNull();
+
+    // Respects minZeroCopyHandoffBytes threshold so <=18 MiB tensors stay off same-buffer handoff
+    const scratchPool = new ExternalDataScratchPool();
+    const bytes = new Uint8Array(8192);
+    bytes.fill(7);
+    const proxy = createSyncAccessExternalDataProxy(
+      bytes.byteLength,
+      (dest, off) => {
+        dest.set(bytes.subarray(off, off + dest.byteLength), 0);
+        return dest.byteLength;
+      },
+      { scratchPool }
+    );
+    const slice = proxy.subarray(0, 8192);
+    const writes: number[] = [];
+    const device = {
+      createBuffer: vi.fn((desc: { size: number }) => ({
+        size: desc.size,
+        getMappedRange: () => new ArrayBuffer(desc.size),
+        unmap: vi.fn(),
+        destroy: vi.fn(),
+      })),
+      createCommandEncoder: vi.fn(() => ({
+        copyBufferToBuffer: vi.fn(),
+        finish: vi.fn(() => ({})),
+      })),
+      queue: {
+        writeBuffer: vi.fn((_b: unknown, _o: number, data: Uint8Array) => {
+          writes.push(data.byteLength);
+        }),
+        submit: vi.fn(),
+      },
+    };
+    const thresholdOpt = installWebGpuUploadOptimizer(device, {
+      sharedScratchPool: scratchPool,
+      minZeroCopyHandoffBytes: DEFAULT_RETAINED_SCRATCH_MAX_BYTES,
+      elideEmptyCommandEncoders: false,
+    });
+    const st = device.createBuffer({ size: 8192, usage: 6, mappedAtCreation: true } as never) as {
+      getMappedRange(): ArrayBuffer;
+      unmap(): void;
+      destroy(): void;
+    };
+    const mappedAb = st.getMappedRange();
+    expect(mappedAb).not.toBe(slice.buffer);
+    st.unmap();
+    device.createCommandEncoder().copyBufferToBuffer(st, 0, {}, 0, 8192);
+    expect(writes.length).toBeGreaterThan(0);
+    st.destroy();
+    thresholdOpt.dispose();
+
+    // SessionLoadCoordinator.reset clears aborted state for clean sequential retry
+    const coord = new SessionLoadCoordinator();
+    coord.abortAll(new Error('first attempt failed'));
+    coord.reset();
+    await expect(coord.enterGroup('decoder_model_merged')).resolves.toBeUndefined();
+    coord.completeActiveGroup();
+
+    // withSerializedInferenceSessions retries in-place via shouldRetryCreate without poisoning callers
+    const cleanupCalls: number[] = [];
+    const seenExternalData: unknown[] = [];
+    let attempt = 0;
+    const retryTarget = {
+      create: vi.fn(async (_model: unknown, opts: { externalData?: unknown[] }) => {
+        seenExternalData.push([...(opts.externalData ?? [])]);
+        attempt += 1;
+        if (attempt === 1) {
+          throw new Error('Unknown error occurred in memory copy.');
+        }
+        return { inputNames: ['x'], outputNames: ['y'], run: vi.fn(), release: vi.fn() };
+      }) as never,
+    };
+    const retryCoord = new SessionLoadCoordinator();
+    const sessionOpts: { externalData: unknown[] } = {
+      externalData: ['decoder_model_merged_q4f16.onnx_data'],
+    };
+    const retried = await withSerializedInferenceSessions(
+      retryCoord,
+      async () => {
+        const fakeInf = retryTarget as unknown as {
+          create: (m: unknown, o: unknown) => Promise<unknown>;
+        };
+        // Simulate Transformers.js webInitChain `.then(load)` without error recovery
+        let webInitChain: Promise<unknown> = Promise.resolve();
+        const chained = (webInitChain = webInitChain.then(() =>
+          fakeInf.create(new Uint8Array([1, 2, 3]), sessionOpts)
+        ));
+        return chained;
+      },
+      {
+        target: retryTarget,
+        yieldAfterCreateMs: 0,
+        prepareExternalData: async (opts) => {
+          const idx = attempt;
+          opts.externalData = [{ path: 'decoder_model_merged_q4f16.onnx_data', data: new Uint8Array([9]) }];
+          return () => {
+            cleanupCalls.push(idx);
+          };
+        },
+        shouldRetryCreate: async () => attempt === 1,
+      }
+    );
+    expect(retried).toBeDefined();
+    expect(cleanupCalls).toEqual([0, 1]);
+    expect(seenExternalData).toHaveLength(2);
+    expect(sessionOpts.externalData).toEqual([]);
+
+    // Permanent failure in one queued session aborts queued peers before their prepare/create runs
+    const peerCalls: string[] = [];
+    let permIdx = 0;
+    const abortTarget = {
+      create: vi.fn(async () => {
+        const i = permIdx++;
+        peerCalls.push(`create:${i}`);
+        if (i === 0) {
+          throw new Error('Fatal WebGPU error');
+        }
+        return {};
+      }) as never,
+    };
+    await expect(
+      withSerializedInferenceSessions(
+        new SessionLoadCoordinator(),
+        () => {
+          const fakeInf = abortTarget as unknown as {
+            create: (m: unknown, o: unknown) => Promise<unknown>;
+          };
+          return Promise.all([
+            fakeInf.create(new Uint8Array([1]), { externalData: ['a'] }),
+            fakeInf.create(new Uint8Array([2]), { externalData: ['b'] }),
+          ]);
+        },
+        {
+          target: abortTarget,
+          yieldAfterCreateMs: 0,
+          prepareExternalData: async (opts) => {
+            peerCalls.push(`prepare:${JSON.stringify(opts.externalData)}`);
+          },
+          shouldRetryCreate: () => false,
+        }
+      )
+    ).rejects.toThrow('Fatal WebGPU error');
+    expect(peerCalls).toEqual(['prepare:["a"]', 'create:0']);
   });
 });

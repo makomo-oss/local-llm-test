@@ -146,6 +146,15 @@ export class SessionLoadCoordinator {
       waiter.reject(error);
     }
   }
+
+  /**
+   * Clear any aborted state and active group so a sequential retry can reuse the coordinator.
+   */
+  reset(): void {
+    this.disposedError = null;
+    this.activeGroup = null;
+    this.waiters.length = 0;
+  }
 }
 
 /**
@@ -197,6 +206,13 @@ export interface SerializedSessionCreateHooks {
   prepareExternalData?: (
     options: Record<string, unknown>
   ) => Promise<(() => void | Promise<void>) | void>;
+  /**
+   * Optional recovery hook invoked when `origCreate` rejects inside `wrappedCreate`.
+   * Return `true` after updating runtime state (e.g. WebGPU upload fallback profile)
+   * to re-attempt creating the SAME session before any rejection escapes to callers
+   * whose serialization chain would otherwise remain permanently rejected.
+   */
+  shouldRetryCreate?: (err: unknown) => Promise<boolean> | boolean;
 }
 
 /**
@@ -218,6 +234,13 @@ export async function withSerializedInferenceSessions<T>(
   const origCreate = target.create;
 
   let createTail: Promise<void> = Promise.resolve();
+  let sequenceAborted = false;
+  let sequenceAbortError: unknown = null;
+
+  const toAbortError = (): Error =>
+    sequenceAbortError instanceof Error
+      ? sequenceAbortError
+      : new Error(typeof sequenceAbortError === 'string' ? sequenceAbortError : 'Session load aborted');
 
   const wrappedCreate = function (
     this: unknown,
@@ -227,13 +250,27 @@ export async function withSerializedInferenceSessions<T>(
     arg3?: unknown
   ) {
     const run = async () => {
+      if (sequenceAborted) {
+        throw toAbortError();
+      }
+
       // ORT InferenceSession.create supports (path|buffer, options?) or (buffer, byteOffset, byteLength, options?)
       const sessionOptions = arg2 === undefined && arg3 === undefined ? arg1 : arg3;
       const modelData =
         arg0 instanceof Uint8Array && typeof arg1 === 'number' && typeof arg2 === 'number'
           ? arg0.subarray(arg1, arg1 + arg2)
           : arg0;
-      let cleanupExternalData: (() => void | Promise<void>) | void = undefined;
+      const optsObj =
+        sessionOptions && typeof sessionOptions === 'object'
+          ? (sessionOptions as Record<string, unknown>)
+          : null;
+      const savedExternalData =
+        optsObj && Array.isArray(optsObj.externalData)
+          ? optsObj.externalData.map((entry) =>
+              entry && typeof entry === 'object' ? { ...(entry as Record<string, unknown>) } : entry
+            )
+          : null;
+
       try {
         if (hooks.interceptCreate) {
           const intercepted = await hooks.interceptCreate(modelData, sessionOptions);
@@ -242,35 +279,69 @@ export async function withSerializedInferenceSessions<T>(
             return intercepted as InferenceSession;
           }
         }
-        if (
-          hooks.prepareExternalData &&
-          sessionOptions &&
-          typeof sessionOptions === 'object'
-        ) {
-          cleanupExternalData = await hooks.prepareExternalData(
-            sessionOptions as Record<string, unknown>
-          );
-        }
-        const session = await (
-          origCreate as unknown as (...args: unknown[]) => Promise<InferenceSession>
-        ).apply(this, [
-          arg0,
-          ...(arg1 !== undefined ? [arg1] : []),
-          ...(arg2 !== undefined ? [arg2] : []),
-          ...(arg3 !== undefined ? [arg3] : []),
-        ]);
-        hooks.onSessionCreated?.();
-        return session;
-      } finally {
-        try {
-          await cleanupExternalData?.();
-        } finally {
-          releaseSessionExternalData(sessionOptions);
-          if (yieldMs > 0) {
-            await new Promise<void>((resolve) => setTimeout(resolve, yieldMs));
+
+        let attemptNum = 0;
+        for (;;) {
+          if (sequenceAborted) {
+            throw toAbortError();
           }
-          coordinator.completeActiveGroup();
+
+          if (attemptNum > 0 && optsObj && savedExternalData && Array.isArray(optsObj.externalData)) {
+            const restored = savedExternalData.map((entry) =>
+              entry && typeof entry === 'object' ? { ...(entry as Record<string, unknown>) } : entry
+            );
+            optsObj.externalData.splice(0, optsObj.externalData.length, ...restored);
+          }
+          attemptNum += 1;
+
+          let cleanupExternalData: (() => void | Promise<void>) | void = undefined;
+          let reachedOrigCreate = false;
+          try {
+            if (hooks.prepareExternalData && optsObj) {
+              cleanupExternalData = await hooks.prepareExternalData(optsObj);
+            }
+            reachedOrigCreate = true;
+            const session = await (
+              origCreate as unknown as (...args: unknown[]) => Promise<InferenceSession>
+            ).apply(this, [
+              arg0,
+              ...(arg1 !== undefined ? [arg1] : []),
+              ...(arg2 !== undefined ? [arg2] : []),
+              ...(arg3 !== undefined ? [arg3] : []),
+            ]);
+            hooks.onSessionCreated?.();
+            return session;
+          } catch (createErr) {
+            const cleanup = cleanupExternalData;
+            cleanupExternalData = undefined;
+            await cleanup?.();
+            if (
+              reachedOrigCreate &&
+              !sequenceAborted &&
+              hooks.shouldRetryCreate &&
+              (await hooks.shouldRetryCreate(createErr))
+            ) {
+              continue;
+            }
+            throw createErr;
+          } finally {
+            const cleanup = cleanupExternalData;
+            cleanupExternalData = undefined;
+            await cleanup?.();
+          }
         }
+      } catch (sessionErr) {
+        sequenceAborted = true;
+        if (sequenceAbortError === null) {
+          sequenceAbortError = sessionErr;
+        }
+        throw sessionErr;
+      } finally {
+        releaseSessionExternalData(sessionOptions);
+        if (yieldMs > 0 && !sequenceAborted) {
+          await new Promise<void>((resolve) => setTimeout(resolve, yieldMs));
+        }
+        coordinator.completeActiveGroup();
       }
     };
 
@@ -286,10 +357,16 @@ export async function withSerializedInferenceSessions<T>(
   try {
     return await fn();
   } catch (err) {
+    sequenceAborted = true;
+    if (sequenceAbortError === null) {
+      sequenceAbortError = err;
+    }
     coordinator.abortAll(err);
     throw err;
   } finally {
     target.create = origCreate;
+    sequenceAborted = true;
     coordinator.abortAll();
+    await createTail;
   }
 }

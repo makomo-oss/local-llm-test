@@ -311,6 +311,15 @@ export class ExternalDataSessionBridge {
     error: unknown;
   } | null = null;
 
+  peekLastReadError(): {
+    url: string;
+    offset: number;
+    length: number;
+    error: unknown;
+  } | null {
+    return this.lastReadError;
+  }
+
   consumeLastReadError(): {
     url: string;
     offset: number;

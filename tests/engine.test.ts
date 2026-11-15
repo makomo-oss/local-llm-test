@@ -2047,4 +2047,42 @@ describe('Mobile OPFS persistence, session serialization & worker lifecycle', ()
       fullBytes
     );
   });
+
+  it('reallocates BYOB staging cleanly when a reader returns a undersized buffer (< 4096 bytes)', async () => {
+    const viewSizesSeen: number[] = [];
+    const receivedChunks: number[] = [];
+    let callIdx = 0;
+    const fakeStream = {
+      getReader(opts?: { mode?: string }) {
+        expect(opts).toEqual({ mode: 'byob' });
+        return {
+          async read(view: Uint8Array) {
+            viewSizesSeen.push(view.byteLength);
+            callIdx += 1;
+            if (callIdx === 1) {
+              const tiny = new Uint8Array(512);
+              tiny.fill(1);
+              return { done: false, value: tiny };
+            }
+            if (callIdx === 2) {
+              view.set([2, 3, 4], 0);
+              return { done: false, value: view.subarray(0, 3) };
+            }
+            return { done: true, value: undefined };
+          },
+          async cancel() {},
+          releaseLock() {},
+        };
+      },
+    } as unknown as ReadableStream<Uint8Array>;
+
+    await readStreamChunks(fakeStream, {
+      stagingBytes: 4096,
+      onChunk(chunk) {
+        receivedChunks.push(chunk.byteLength);
+      },
+    });
+    expect(viewSizesSeen).toEqual([4096, 4096, 4096]);
+    expect(receivedChunks).toEqual([512, 3]);
+  });
 });
