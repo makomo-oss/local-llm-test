@@ -516,4 +516,29 @@ describe('acquireGpuDeviceForPreference', () => {
     expect(acquired.appliedCustomLimits).toBe(false);
     expect(acquired.grantedFeatures).toEqual([]);
   });
+
+  it('reports actual granted device.limits instead of stale adapter.limits on bare fallback', async () => {
+    const adapter = createMockAdapter({
+      info: { vendor: 'qualcomm', description: 'Adreno Mobile' },
+      features: ['shader-f16'],
+      limits: {
+        maxStorageBufferBindingSize: 1_073_741_824,
+        maxBufferSize: 2_147_483_648,
+      },
+      requestDevice: vi.fn(async () => ({
+        features: new Set(['shader-f16']) as unknown as GPUSupportedFeatures,
+        limits: {
+          maxStorageBufferBindingSize: 134_217_728,
+          maxBufferSize: 268_435_456,
+        } as unknown as GPUSupportedLimits,
+      }) as unknown as GPUDevice),
+    });
+
+    const acquired = await acquireGpuDeviceForPreference('high-performance', {
+      gpu: { requestAdapter: vi.fn(async () => adapter) } as unknown as GPU,
+    });
+
+    expect(acquired.limits.maxStorageBufferBindingSize).toBe(134_217_728);
+    expect(acquired.limits.maxBufferSize).toBe(268_435_456);
+  });
 });

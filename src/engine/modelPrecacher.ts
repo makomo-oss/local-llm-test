@@ -588,12 +588,34 @@ async function streamResponseViaOpfsOrDirectCache(
 
   if (response.body && opfsRoot) {
     let accessHandle: OpfsSyncAccessHandleLike | undefined;
+    let writable: OpfsWritableStreamLike | undefined;
     try {
       const fileHandle = await opfsRoot.getFileHandle(OPFS_PRECACHE_TMP_FILE, { create: true });
       if (typeof fileHandle.createSyncAccessHandle === 'function') {
-        accessHandle = await fileHandle.createSyncAccessHandle();
-        accessHandle.truncate?.(0);
+        try {
+          accessHandle = await fileHandle.createSyncAccessHandle();
+          if (typeof accessHandle.write !== 'function') {
+            throw new Error('OPFS SyncAccessHandle does not support write().');
+          }
+          accessHandle.truncate?.(0);
+        } catch (syncErr) {
+          try {
+            accessHandle?.close();
+          } catch {
+            // Ignore close cleanup failure.
+          }
+          accessHandle = undefined;
+          if (!isQuotaExceededError(syncErr) && typeof fileHandle.createWritable === 'function') {
+            writable = await fileHandle.createWritable();
+          } else {
+            throw syncErr;
+          }
+        }
+      } else if (typeof fileHandle.createWritable === 'function') {
+        writable = await fileHandle.createWritable();
+      }
 
+      if (accessHandle || writable) {
         onFileProgress?.({
           status: 'initiate',
           name,
@@ -618,9 +640,17 @@ async function streamResponseViaOpfsOrDirectCache(
               break;
             }
             if (value && value.byteLength > 0) {
-              let written = 0;
-              while (written < value.byteLength) {
-                written += accessHandle.write(value.subarray(written), { at: loadedBytes + written });
+              if (accessHandle) {
+                let written = 0;
+                while (written < value.byteLength) {
+                  const n = accessHandle.write(value.subarray(written), { at: loadedBytes + written });
+                  if (n <= 0) {
+                    throw new Error(`OPFS write failed at offset ${loadedBytes + written} for ${filePath}`);
+                  }
+                  written += n;
+                }
+              } else if (writable) {
+                await writable.write(value);
               }
               loadedBytes += value.byteLength;
 
@@ -652,9 +682,14 @@ async function streamResponseViaOpfsOrDirectCache(
           throw err;
         }
 
-        accessHandle.flush();
-        accessHandle.close();
-        accessHandle = undefined;
+        if (accessHandle) {
+          accessHandle.flush();
+          accessHandle.close();
+          accessHandle = undefined;
+        } else if (writable) {
+          await writable.close();
+          writable = undefined;
+        }
 
         const diskFile = await fileHandle.getFile();
         const finalBytes = diskFile.size || loadedBytes;
@@ -687,6 +722,9 @@ async function streamResponseViaOpfsOrDirectCache(
         accessHandle?.close();
       } catch {
         // Ignore handle close cleanup failures.
+      }
+      if (writable) {
+        await writable.abort?.().catch(() => {});
       }
       await opfsRoot.removeEntry(OPFS_PRECACHE_TMP_FILE).catch(() => {});
     }

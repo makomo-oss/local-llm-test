@@ -135,8 +135,12 @@ async function writeSmallTextFile(
   const bytes = new TextEncoder().encode(text);
   const handle = await dir.getFileHandle(fileName, { create: true });
   if (typeof handle.createSyncAccessHandle === 'function') {
-    const access = await handle.createSyncAccessHandle();
+    let access: OpfsSyncAccessHandleLike | null = null;
     try {
+      access = await handle.createSyncAccessHandle();
+      if (typeof access.write !== 'function') {
+        throw new Error(`OPFS SyncAccessHandle does not support write() for ${fileName}`);
+      }
       access.truncate?.(0);
       let written = 0;
       while (written < bytes.byteLength) {
@@ -147,14 +151,21 @@ async function writeSmallTextFile(
         written += n;
       }
       access.flush();
+      return;
+    } catch (syncErr) {
+      if (isQuotaOrAbortOpfsError(syncErr) || typeof handle.createWritable !== 'function') {
+        throw syncErr;
+      }
+      // Fall through to WritableStream when SyncAccessHandle rejects (e.g. NotSupportedError).
     } finally {
-      try {
-        access.close();
-      } catch {
-        // Ignore close cleanup failure
+      if (access) {
+        try {
+          access.close();
+        } catch {
+          // Ignore close cleanup failure
+        }
       }
     }
-    return;
   }
   if (typeof handle.createWritable === 'function') {
     const writable = await handle.createWritable();
@@ -219,6 +230,87 @@ export interface OpfsSyncReadHandle {
   close(): void;
 }
 
+interface WorkerFileReaderSyncLike {
+  readAsArrayBuffer(blob: Blob): ArrayBuffer;
+}
+
+function getFileReaderSyncConstructor(): (new () => WorkerFileReaderSyncLike) | undefined {
+  const scope = globalThis as { FileReaderSync?: new () => WorkerFileReaderSyncLike };
+  return typeof scope.FileReaderSync === 'function' ? scope.FileReaderSync : undefined;
+}
+
+function isQuotaOrAbortOpfsError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') {
+    return false;
+  }
+  const maybeErr = err as { name?: unknown; code?: unknown };
+  return (
+    maybeErr.name === 'QuotaExceededError' ||
+    maybeErr.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    maybeErr.name === 'AbortError' ||
+    maybeErr.code === 'STORAGE_QUOTA_EXCEEDED' ||
+    maybeErr.code === 22
+  );
+}
+
+/**
+ * Create a synchronous `OpfsSyncReadHandle` backed by `FileReaderSync.readAsArrayBuffer(blob.slice(...))`
+ * inside Dedicated Web Workers. Avoids buffering multi-GiB files in RAM when `createSyncAccessHandle`
+ * is unavailable or throws (`NotSupportedError` / lock contention on Safari / WebViews).
+ */
+export function createBlobSyncReadHandle(
+  blob: Pick<Blob, 'size' | 'slice'>,
+  url: string,
+  expectedByteLength?: number
+): OpfsSyncReadHandle | undefined {
+  const ReaderSyncCtor = getFileReaderSyncConstructor();
+  if (!ReaderSyncCtor || typeof blob.slice !== 'function') {
+    return undefined;
+  }
+  const totalSize = blob.size;
+  if (!Number.isFinite(totalSize) || totalSize <= 0) {
+    return undefined;
+  }
+  if (
+    typeof expectedByteLength === 'number' &&
+    Number.isFinite(expectedByteLength) &&
+    totalSize !== expectedByteLength
+  ) {
+    return undefined;
+  }
+
+  const reader = new ReaderSyncCtor();
+  let closed = false;
+
+  return {
+    byteLength: totalSize,
+    readAt(dest: Uint8Array, offset: number): number {
+      if (closed) {
+        throw new Error(`OPFS FileReaderSync handle is already closed for ${url}`);
+      }
+      const safeOffset = Number.isFinite(offset) ? Math.max(0, Math.trunc(offset)) : 0;
+      if (dest.byteLength <= 0 || safeOffset >= totalSize) {
+        return 0;
+      }
+      const end = Math.min(totalSize, safeOffset + dest.byteLength);
+      if (end <= safeOffset) {
+        return 0;
+      }
+      const ab = reader.readAsArrayBuffer(blob.slice(safeOffset, end));
+      const chunk = new Uint8Array(ab);
+      const copyLen = Math.min(dest.byteLength, chunk.byteLength);
+      if (copyLen <= 0) {
+        return 0;
+      }
+      dest.set(copyLen === chunk.byteLength ? chunk : chunk.subarray(0, copyLen), 0);
+      return copyLen;
+    },
+    close(): void {
+      closed = true;
+    },
+  };
+}
+
 async function resolveValidatedOpfsEntry(
   opfsRoot: OpfsDirectoryLike | null | undefined,
   url: string
@@ -275,56 +367,72 @@ export async function openOpfsSyncReadHandle(
   url: string
 ): Promise<OpfsSyncReadHandle | undefined> {
   const entry = await resolveValidatedOpfsEntry(opfsRoot, url);
-  if (!entry || typeof entry.fileHandle.createSyncAccessHandle !== 'function') {
+  if (!entry) {
     return undefined;
   }
 
-  let accessHandle: OpfsSyncAccessHandleLike | null = null;
-  try {
-    accessHandle = await entry.fileHandle.createSyncAccessHandle();
-    if (typeof accessHandle.read !== 'function') {
+  if (typeof entry.fileHandle.createSyncAccessHandle === 'function') {
+    let accessHandle: OpfsSyncAccessHandleLike | null = null;
+    try {
+      accessHandle = await entry.fileHandle.createSyncAccessHandle();
+      const totalSize =
+        typeof accessHandle.getSize === 'function' ? accessHandle.getSize() : entry.meta.byteLength;
+      if (
+        typeof accessHandle.read === 'function' &&
+        Number.isFinite(totalSize) &&
+        totalSize === entry.meta.byteLength
+      ) {
+        const readFn = accessHandle.read.bind(accessHandle);
+        let closed = false;
+        return {
+          byteLength: totalSize,
+          readAt(dest: Uint8Array, offset: number): number {
+            if (closed) {
+              throw new Error(`OPFS SyncAccessHandle is already closed for ${url}`);
+            }
+            return readFn(dest, { at: offset });
+          },
+          close(): void {
+            if (closed || !accessHandle) {
+              return;
+            }
+            closed = true;
+            try {
+              accessHandle.close();
+            } catch {
+              // Ignore close errors during teardown
+            }
+          },
+        };
+      }
       accessHandle.close();
-      return undefined;
-    }
-    const readFn = accessHandle.read.bind(accessHandle);
-    const totalSize =
-      typeof accessHandle.getSize === 'function' ? accessHandle.getSize() : entry.meta.byteLength;
-    if (!Number.isFinite(totalSize) || totalSize !== entry.meta.byteLength) {
-      accessHandle.close();
-      return undefined;
-    }
-
-    let closed = false;
-    return {
-      byteLength: totalSize,
-      readAt(dest: Uint8Array, offset: number): number {
-        if (closed) {
-          throw new Error(`OPFS SyncAccessHandle is already closed for ${url}`);
-        }
-        return readFn(dest, { at: offset });
-      },
-      close(): void {
-        if (closed || !accessHandle) {
-          return;
-        }
-        closed = true;
+      accessHandle = null;
+    } catch {
+      if (accessHandle) {
         try {
           accessHandle.close();
         } catch {
-          // Ignore close errors during teardown
+          // Ignore close errors
         }
-      },
-    };
-  } catch {
-    if (accessHandle) {
-      try {
-        accessHandle.close();
-      } catch {
-        // Ignore close errors
       }
     }
-    return undefined;
   }
+
+  // Fallback for Safari/WebViews or locked SyncAccessHandles inside Web Workers:
+  // stream slices synchronously from OPFS File without buffering the full binary in RAM.
+  if (typeof entry.fileHandle.getFile === 'function') {
+    try {
+      const file = await entry.fileHandle.getFile();
+      const blobHandle = createBlobSyncReadHandle(file, url, entry.meta.byteLength);
+      if (blobHandle) {
+        return blobHandle;
+      }
+    } catch {
+      // Ignore and let callers fall back gracefully.
+    }
+  }
+
+  return undefined;
 }
 
 /**
@@ -382,8 +490,30 @@ export async function writeStreamToOpfsStore(options: {
 
   try {
     if (typeof fileHandle.createSyncAccessHandle === 'function') {
-      accessHandle = await fileHandle.createSyncAccessHandle();
-      accessHandle.truncate?.(0);
+      try {
+        accessHandle = await fileHandle.createSyncAccessHandle();
+        if (typeof accessHandle.write !== 'function') {
+          throw new Error('OPFS SyncAccessHandle does not support write().');
+        }
+        accessHandle.truncate?.(0);
+      } catch (syncErr) {
+        if (accessHandle) {
+          try {
+            accessHandle.close();
+          } catch {
+            // Ignore close cleanup failure
+          }
+          accessHandle = null;
+        }
+        if (
+          !isQuotaOrAbortOpfsError(syncErr) &&
+          typeof fileHandle.createWritable === 'function'
+        ) {
+          writable = await fileHandle.createWritable();
+        } else {
+          throw syncErr;
+        }
+      }
     } else if (typeof fileHandle.createWritable === 'function') {
       writable = await fileHandle.createWritable();
     } else {

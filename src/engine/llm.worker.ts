@@ -14,17 +14,23 @@ import {
   type ProgressInfo,
 } from '@huggingface/transformers';
 import {
+  MODEL_CATALOG,
+  formatBytes,
   getModelById,
   getResolvedDownloadBytes,
   parseThinkingOutput,
   resolveEffectiveDtype,
 } from '../models/catalog.ts';
-import { detectMobileDeviceContext } from '../telemetry/systemProbe.ts';
+import {
+  detectMobileDeviceContext,
+  resolveEffectiveWebGpuSingleBufferLimitBytes,
+} from '../telemetry/systemProbe.ts';
 import type {
   DeviceOption,
   DownloadFileProgress,
   ExecutionBackend,
   InferenceSpeedMetrics,
+  ModelCacheInfo,
   ModelLoadProgress,
   ModelLoadStage,
   ModelSpec,
@@ -34,7 +40,12 @@ import type {
   WorkerRequest,
   WorkerResponse,
 } from '../types.ts';
-import { TRANSFORMERS_CACHE_NAME, clearModelCache, inspectModelCaches } from './cacheManager.ts';
+import {
+  TRANSFORMERS_CACHE_NAME,
+  clearModelCache,
+  getBrowserStorageEstimate,
+  inspectModelCaches,
+} from './cacheManager.ts';
 import {
   acquireGpuDeviceForPreference,
   getDeviceRuntimeDetails,
@@ -57,6 +68,7 @@ import {
 import { ExternalDataSessionBridge } from './externalDataProxy.ts';
 import { resolveOpfsRootDirectory, type OpfsDirectoryLike } from './opfsCacheStore.ts';
 import { SessionLoadCoordinator, withSerializedInferenceSessions } from './sessionSerializer.ts';
+import { installWebGpuUploadOptimizer } from './webgpuUploadOptimizer.ts';
 
 const TRAILING_SPECIAL_DELIMITER_REGEX =
   /(?:(?:<turn\|>|<\|im_end\|>|<\|eot_id\|>|<\|end_of_text\|>|<end_of_turn>|<eos>|<\|endoftext\|>|<\/s>)\s*)+$/;
@@ -481,6 +493,7 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
   }
 
   if (
+    explicitCode === 'WEBGPU_BUFFER_LIMIT' ||
     /maxStorageBufferBindingSize|maxBufferSize|exceeds max.*buffer size|createBuffer.*exceed|storage buffer.*limit|Binding size .* is larger than/i.test(
       rawMessage
     )
@@ -516,6 +529,94 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
     code: 'MODEL_LOAD_FAILED',
     message: `モデルのロードに失敗しました: ${rawMessage}`,
   };
+}
+
+const MIN_PREFLIGHT_CHECK_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Verify that the acquired WebGPU device buffer limit can allocate the model's largest
+ * weight tensor before starting multi-GiB model downloads.
+ */
+export function assertWebGpuSingleTensorLimit(
+  modelSpec: ModelSpec,
+  deviceOption: Pick<DeviceOption, 'backend' | 'limits'>,
+  resolved: Pick<ResolvedDtype, 'dtype' | 'onDemandEmbedTokens' | 'maxSingleTensorBytes'>
+): void {
+  if (
+    deviceOption.backend !== 'webgpu' ||
+    typeof resolved.maxSingleTensorBytes !== 'number' ||
+    !Number.isFinite(resolved.maxSingleTensorBytes) ||
+    resolved.maxSingleTensorBytes <= 0
+  ) {
+    return;
+  }
+
+  const allowSplitStorageBindings =
+    resolved.onDemandEmbedTokens !== false && modelSpec.architecture !== 'LlamaForCausalLM';
+  const gpuLimit = resolveEffectiveWebGpuSingleBufferLimitBytes(
+    deviceOption.limits,
+    allowSplitStorageBindings
+  );
+
+  if (gpuLimit !== undefined && resolved.maxSingleTensorBytes > gpuLimit) {
+    const err = new Error(
+      `maxBufferSize (${formatBytes(gpuLimit)}) is smaller than ${modelSpec.name} (${resolved.dtype}) max tensor (${formatBytes(resolved.maxSingleTensorBytes)}).`
+    ) as Error & { code?: string };
+    err.code = 'WEBGPU_BUFFER_LIMIT';
+    throw err;
+  }
+}
+
+/**
+ * Verify available origin storage quota against uncached download bytes before starting
+ * multi-GiB model downloads on constrained mobile browsers.
+ */
+export function assertStorageQuotaForDownload(
+  modelSpec: ModelSpec,
+  resolved: ResolvedDtype,
+  availableBytes: number | undefined,
+  cacheInfos: readonly ModelCacheInfo[],
+  models: readonly ModelSpec[] = MODEL_CATALOG
+): void {
+  if (typeof availableBytes !== 'number' || !Number.isFinite(availableBytes) || availableBytes < 0) {
+    return;
+  }
+
+  const expectedDownloadBytes = getResolvedDownloadBytes(modelSpec, resolved, true);
+  if (expectedDownloadBytes <= MIN_PREFLIGHT_CHECK_BYTES) {
+    return;
+  }
+
+  const targetCachedBytes =
+    cacheInfos.find((entry) => entry.modelId === modelSpec.id)?.cachedBytes ?? 0;
+  const remainingNeededBytes = Math.max(0, expectedDownloadBytes - targetCachedBytes);
+  if (
+    remainingNeededBytes <= MIN_PREFLIGHT_CHECK_BYTES ||
+    availableBytes >= remainingNeededBytes * 0.9
+  ) {
+    return;
+  }
+
+  const otherCached = cacheInfos
+    .filter((entry) => entry.modelId !== modelSpec.id && entry.cachedBytes > 0)
+    .sort((a, b) => b.cachedBytes - a.cachedBytes)
+    .slice(0, 2)
+    .map((entry) => {
+      const name = models.find((m) => m.id === entry.modelId)?.name ?? entry.modelId;
+      return `${name} (${formatBytes(entry.cachedBytes)})`;
+    });
+
+  const otherHint =
+    otherCached.length > 0
+      ? ` 他モデルのキャッシュ [${otherCached.join(', ')}] を削除すると容量を確保できます。`
+      : '';
+
+  const quotaErr = new Error(
+    `空きストレージ容量 (${formatBytes(availableBytes)}) が ${modelSpec.name} (${resolved.dtype}) の残りダウンロード量 (約 ${formatBytes(remainingNeededBytes)}) より不足しています。${otherHint}`
+  ) as Error & { code?: string };
+  quotaErr.name = 'QuotaExceededError';
+  quotaErr.code = 'STORAGE_QUOTA_EXCEEDED';
+  throw quotaErr;
 }
 
 function buildWorkerDeviceOption(
@@ -821,6 +922,8 @@ async function handleLoadModel(
       useExternalDataFormat: req.useExternalDataFormat,
     });
 
+    assertWebGpuSingleTensorLimit(modelSpec, deviceOption, resolved);
+
     if (resolved.adjusted && resolved.reason) {
       notices.push(resolved.reason);
     }
@@ -892,6 +995,17 @@ async function handleLoadModel(
           );
         }
       }
+      const [storageEstimate, cacheInfos] = await Promise.all([
+        getBrowserStorageEstimate().catch(() => ({})),
+        inspectModelCaches(MODEL_CATALOG, { opfsRoot }).catch(() => [] as ModelCacheInfo[]),
+      ]);
+      assertStorageQuotaForDownload(
+        modelSpec,
+        resolved,
+        (storageEstimate as { availableBytes?: number }).availableBytes,
+        cacheInfos
+      );
+
       aggregator.registerExpectedFiles(modelFiles.filter((file) => !isOptionalModelFile(file)));
       const precacheResult = await precacheModelFilesSequentially({
         repoId: modelSpec.repoId,
@@ -953,87 +1067,95 @@ async function handleLoadModel(
 
     const cacheName = env.cacheKey || TRANSFORMERS_CACHE_NAME;
     const useOnDemandEmbed = resolved.onDemandEmbedTokens !== false;
+    const webGpuOptimizer =
+      deviceOption.backend === 'webgpu' && acquiredGpu
+        ? installWebGpuUploadOptimizer(acquiredGpu.device)
+        : null;
 
-    loadedModel = await withSerializedInferenceSessions(
-      sessionCoordinator,
-      () => AutoModelForCausalLM.from_pretrained(modelSpec.repoId, modelOptions),
-      {
-        interceptCreate: async (modelData, sessionOptions) => {
-          if (!useOnDemandEmbed || !(modelData instanceof Uint8Array)) {
-            return null;
-          }
-          const plan = parseOnnxEmbedTokensPlan(modelData);
-          if (!plan) {
-            return null;
-          }
-          const isEmbedSession =
-            plan.outputNames.includes('inputs_embeds') ||
-            plan.externalLocations.some((loc) => /embed_tokens/i.test(loc));
-          if (!isEmbedSession) {
-            return null;
-          }
+    try {
+      loadedModel = await withSerializedInferenceSessions(
+        sessionCoordinator,
+        () => AutoModelForCausalLM.from_pretrained(modelSpec.repoId, modelOptions),
+        {
+          interceptCreate: async (modelData, sessionOptions) => {
+            if (!useOnDemandEmbed || !(modelData instanceof Uint8Array)) {
+              return null;
+            }
+            const plan = parseOnnxEmbedTokensPlan(modelData);
+            if (!plan) {
+              return null;
+            }
+            const isEmbedSession =
+              plan.outputNames.includes('inputs_embeds') ||
+              plan.externalLocations.some((loc) => /embed_tokens/i.test(loc));
+            if (!isEmbedSession) {
+              return null;
+            }
 
-          const urlByLocation = new Map<string, string>();
-          const inlineBlobs = new Map<string, Blob>();
-          const optsObj =
-            sessionOptions && typeof sessionOptions === 'object'
-              ? (sessionOptions as { externalData?: unknown[] })
-              : undefined;
-          if (Array.isArray(optsObj?.externalData)) {
-            for (const entry of optsObj.externalData) {
-              if (!entry || typeof entry !== 'object') {
-                continue;
-              }
-              const obj = entry as { path?: unknown; data?: unknown };
-              const pathKey = typeof obj.path === 'string' ? obj.path.replace(/^\.\//, '') : '';
-              const baseKey = pathKey ? (pathKey.split('/').pop() ?? pathKey) : '';
-              if (typeof obj.data === 'string' && pathKey) {
-                urlByLocation.set(pathKey, obj.data);
-                if (baseKey) {
-                  urlByLocation.set(baseKey, obj.data);
+            const urlByLocation = new Map<string, string>();
+            const inlineBlobs = new Map<string, Blob>();
+            const optsObj =
+              sessionOptions && typeof sessionOptions === 'object'
+                ? (sessionOptions as { externalData?: unknown[] })
+                : undefined;
+            if (Array.isArray(optsObj?.externalData)) {
+              for (const entry of optsObj.externalData) {
+                if (!entry || typeof entry !== 'object') {
+                  continue;
                 }
-              } else if (obj.data instanceof Uint8Array && pathKey) {
-                const blob = new Blob([obj.data as BlobPart]);
-                inlineBlobs.set(pathKey, blob);
-                if (baseKey) {
-                  inlineBlobs.set(baseKey, blob);
+                const obj = entry as { path?: unknown; data?: unknown };
+                const pathKey = typeof obj.path === 'string' ? obj.path.replace(/^\.\//, '') : '';
+                const baseKey = pathKey ? (pathKey.split('/').pop() ?? pathKey) : '';
+                if (typeof obj.data === 'string' && pathKey) {
+                  urlByLocation.set(pathKey, obj.data);
+                  if (baseKey) {
+                    urlByLocation.set(baseKey, obj.data);
+                  }
+                } else if (obj.data instanceof Uint8Array && pathKey) {
+                  const blob = new Blob([obj.data as BlobPart]);
+                  inlineBlobs.set(pathKey, blob);
+                  if (baseKey) {
+                    inlineBlobs.set(baseKey, blob);
+                  }
                 }
               }
             }
-          }
 
-          for (const loc of plan.externalLocations) {
-            if (!urlByLocation.has(loc)) {
-              const registered = externalDataBridge.resolveUrl(loc);
-              if (registered) {
-                urlByLocation.set(loc, registered);
+            for (const loc of plan.externalLocations) {
+              if (!urlByLocation.has(loc)) {
+                const registered = externalDataBridge.resolveUrl(loc);
+                if (registered) {
+                  urlByLocation.set(loc, registered);
+                }
               }
             }
-          }
 
-          const baseResolveBlob = createExternalBlobResolver({
-            urlByLocation,
-            opfsRoot,
-            cacheName,
-          });
-          return createOnDemandEmbedTokensSession(plan, async (location) => {
-            const clean = location.replace(/^\.\//, '');
-            const base = clean.split('/').pop() ?? clean;
-            const inline =
-              inlineBlobs.get(location) ?? inlineBlobs.get(clean) ?? inlineBlobs.get(base);
-            if (inline) {
-              return inline;
-            }
-            return baseResolveBlob(location);
-          });
-        },
-        prepareExternalData: (options) =>
-          externalDataBridge.prepareSessionExternalData(options, {
-            opfsRoot,
-            cacheName,
-          }),
-      }
-    );
+            const baseResolveBlob = createExternalBlobResolver({
+              urlByLocation,
+              opfsRoot,
+              cacheName,
+            });
+            return createOnDemandEmbedTokensSession(plan, async (location) => {
+              const clean = location.replace(/^\.\//, '');
+              const base = clean.split('/').pop() ?? clean;
+              const inline =
+                inlineBlobs.get(location) ?? inlineBlobs.get(clean) ?? inlineBlobs.get(base);
+              if (inline) {
+                return inline;
+              }
+              return baseResolveBlob(location);
+            });
+          },
+          prepareExternalData: (options) =>
+            externalDataBridge.prepareSessionExternalData(options, {
+              opfsRoot,
+              cacheName,
+            }),
+        }
+      );
+    } finally {
+      webGpuOptimizer?.dispose();
+    }
 
     // Release cached WASM Uint8Array binary once WebAssembly module has been compiled/instantiated.
     const wasmEnvAfterLoad = env.backends?.onnx?.wasm as { wasmBinary?: Uint8Array } | undefined;

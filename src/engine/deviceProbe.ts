@@ -605,6 +605,7 @@ export async function acquireGpuDeviceForPreference(
     ? extractFeatureNames(device.features)
     : requestedFeaturesForDevice;
   const supportsFp16 = grantedFeatures.includes('shader-f16');
+  const grantedLimits = device.limits ? extractLimitsSnapshot(device.limits) : {};
 
   return {
     adapter,
@@ -615,7 +616,7 @@ export async function acquireGpuDeviceForPreference(
     fingerprintMatched,
     features,
     grantedFeatures,
-    limits,
+    limits: Object.keys(grantedLimits).length > 0 ? grantedLimits : limits,
     supportsFp16,
     appliedCustomLimits,
   };

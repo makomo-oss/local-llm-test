@@ -1,4 +1,8 @@
-import { formatBytes } from '../models/catalog.ts';
+import {
+  MODEL_CATALOG,
+  formatBytes,
+  resolveEffectiveDtype,
+} from '../models/catalog.ts';
 import type { DeviceOption, ModelId, ModelSpec, QuantDtype, ResolvedDtype } from '../types.ts';
 
 /**
@@ -446,10 +450,78 @@ export function detectMobileDeviceContext(
   };
 }
 
+function isPositiveFiniteLimit(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+/**
+ * Determine the effective single-tensor GPUBuffer limit for a WebGPU device.
+ * Split ONNX models (`onDemandEmbedTokens` + `MatMulNBits` decoder weights) split
+ * storage buffer bindings across chunks of `maxStorageBufferBindingSize` in ORT WebGPU,
+ * so `maxBufferSize` is their real single-buffer allocation ceiling; monolithic `Gather`
+ * models remain constrained by the smaller of `maxStorageBufferBindingSize` and `maxBufferSize`.
+ */
+export function resolveEffectiveWebGpuSingleBufferLimitBytes(
+  limits: Readonly<Record<string, number>> | undefined,
+  allowSplitStorageBindings: boolean
+): number | undefined {
+  if (!limits) {
+    return undefined;
+  }
+  const storageLimit = isPositiveFiniteLimit(limits.maxStorageBufferBindingSize)
+    ? limits.maxStorageBufferBindingSize
+    : undefined;
+  const bufferLimit = isPositiveFiniteLimit(limits.maxBufferSize) ? limits.maxBufferSize : undefined;
+
+  if (allowSplitStorageBindings) {
+    return bufferLimit ?? storageLimit;
+  }
+
+  if (storageLimit !== undefined && bufferLimit !== undefined) {
+    return Math.min(storageLimit, bufferLimit);
+  }
+  return bufferLimit ?? storageLimit;
+}
+
+function formatSmallerGpuAlternativeDetail(
+  selectedModel: ModelSpec,
+  dtype: QuantDtype,
+  effectiveGpuLimitBytes: number
+): string {
+  const candidates = MODEL_CATALOG.map((candidate) => {
+    if (candidate.id === selectedModel.id) {
+      return null;
+    }
+    const resolved = resolveEffectiveDtype(
+      candidate,
+      {
+        backend: 'webgpu',
+        supportsFp16: dtype === 'q4f16' || dtype === 'fp16',
+        features: dtype === 'q4f16' || dtype === 'fp16' ? ['shader-f16'] : [],
+      },
+      dtype
+    );
+    const maxBytes = resolved.maxSingleTensorBytes;
+    if (typeof maxBytes !== 'number' || !Number.isFinite(maxBytes) || maxBytes > effectiveGpuLimitBytes) {
+      return null;
+    }
+    return { name: candidate.name, maxBytes };
+  })
+    .filter((entry): entry is { name: string; maxBytes: number } => entry !== null)
+    .sort((a, b) => a.maxBytes - b.maxBytes)
+    .slice(0, 2);
+
+  if (candidates.length === 0) {
+    return 'CPU (WASM) デバイスへ切り替えてください。';
+  }
+  const labels = candidates.map((c) => `「${c.name}」(約 ${formatBytes(c.maxBytes)})`).join(' や ');
+  return `CPU (WASM) デバイスへ切り替えるか、単一テンソルが小さい ${labels} を選択してください。`;
+}
+
 /**
  * Assess end-of-download ONNX initialization memory & GPU buffer risk so smartphones,
  * low-RAM browsers, and WebGPU devices warn cleanly before hitting Jetsam / OOM /
- * wasm32 / `maxStorageBufferBindingSize` ceilings.
+ * wasm32 / `maxBufferSize` ceilings.
  */
 export function assessModelMemoryRisk(
   model: ModelSpec,
@@ -495,31 +567,30 @@ export function assessModelMemoryRisk(
           Math.max(0, model.tokenizerBytes)
       );
 
-  // 0. WebGPU single-tensor buffer size ceiling (`maxStorageBufferBindingSize` / `maxBufferSize`)
+  // 0. WebGPU single-tensor buffer size ceiling (`maxBufferSize` for split MatMulNBits,
+  // `min(maxStorageBufferBindingSize, maxBufferSize)` for monolithic Gather graphs)
   if (
     device?.backend === 'webgpu' &&
     typeof resolved.maxSingleTensorBytes === 'number' &&
     Number.isFinite(resolved.maxSingleTensorBytes) &&
     resolved.maxSingleTensorBytes > 0
   ) {
-    const candidateLimits = [
-      device.limits?.maxStorageBufferBindingSize,
-      device.limits?.maxBufferSize,
-    ].filter((val): val is number => typeof val === 'number' && Number.isFinite(val) && val > 0);
-    if (candidateLimits.length > 0) {
-      const effectiveGpuLimit = Math.min(...candidateLimits);
-      if (resolved.maxSingleTensorBytes > effectiveGpuLimit) {
-        return {
-          level: 'high',
-          isMobile: ctx.isMobile,
-          estimatedRuntimeBytes,
-          estimatedLoadPeakBytes,
-          estimatedTabBudgetBytes: effectiveGpuLimit,
-          headline: `選択中の WebGPU デバイスの単一バッファ上限 (${formatBytes(effectiveGpuLimit)}) が ${model.name} (${resolved.dtype}) の最大テンソル (${formatBytes(resolved.maxSingleTensorBytes)}) より小さいためロードに失敗する可能性が高いです。`,
-          detail:
-            'CPU (WASM) デバイスへ切り替えるか、単一テンソルが小さい「Qwen 3.5 0.8B」(約 121.3 MiB) や「Gemma 4 E2B」(約 192 MiB) を選択してください。',
-        };
-      }
+    const allowSplitStorageBindings =
+      hasStreamingRuntime && model.architecture !== 'LlamaForCausalLM';
+    const effectiveGpuLimit = resolveEffectiveWebGpuSingleBufferLimitBytes(
+      device.limits,
+      allowSplitStorageBindings
+    );
+    if (effectiveGpuLimit !== undefined && resolved.maxSingleTensorBytes > effectiveGpuLimit) {
+      return {
+        level: 'high',
+        isMobile: ctx.isMobile,
+        estimatedRuntimeBytes,
+        estimatedLoadPeakBytes,
+        estimatedTabBudgetBytes: effectiveGpuLimit,
+        headline: `選択中の WebGPU デバイスの単一バッファ上限 (${formatBytes(effectiveGpuLimit)}) が ${model.name} (${resolved.dtype}) の最大テンソル (${formatBytes(resolved.maxSingleTensorBytes)}) より小さいためロードに失敗する可能性が高いです。`,
+        detail: formatSmallerGpuAlternativeDetail(model, resolved.dtype, effectiveGpuLimit),
+      };
     }
   }
 

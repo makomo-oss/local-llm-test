@@ -1,4 +1,41 @@
-import { openOpfsSyncReadHandle, readOpfsCachedResponse, type OpfsDirectoryLike, type OpfsSyncReadHandle } from './opfsCacheStore.ts';
+import {
+  createBlobSyncReadHandle,
+  openOpfsSyncReadHandle,
+  readOpfsCachedResponse,
+  type OpfsDirectoryLike,
+  type OpfsSyncReadHandle,
+} from './opfsCacheStore.ts';
+
+/**
+ * Reusable single-buffer scratch pool for synchronous ORT `externalData.subarray()`
+ * slice reads during serialized `InferenceSession.create()` calls. Reuses one growing
+ * `ArrayBuffer` (released immediately after session init) instead of allocating ~900+
+ * multi-MiB temporary `Uint8Array`s totaling 1.5-2.9 GiB of JS heap churn.
+ */
+export class ExternalDataScratchPool {
+  private buffer: ArrayBuffer | null = null;
+
+  acquire(byteLength: number): Uint8Array {
+    if (!Number.isFinite(byteLength) || byteLength <= 0) {
+      return new Uint8Array(0);
+    }
+    const len = Math.floor(byteLength);
+    if (!this.buffer || this.buffer.byteLength < len) {
+      // Clear previous buffer reference before allocating a larger capacity so they never overlap.
+      this.buffer = null;
+      this.buffer = new ArrayBuffer(len);
+    }
+    return new Uint8Array(this.buffer, 0, len);
+  }
+
+  release(): void {
+    this.buffer = null;
+  }
+}
+
+export interface SyncAccessExternalDataProxyOptions {
+  scratchPool?: ExternalDataScratchPool;
+}
 
 /**
  * Create a lightweight `Uint8Array`-prototype slice reader backed synchronously by an OPFS
@@ -10,10 +47,12 @@ import { openOpfsSyncReadHandle, readOpfsCachedResponse, type OpfsDirectoryLike,
  */
 export function createSyncAccessExternalDataProxy(
   byteLength: number,
-  readAt: (dest: Uint8Array, offset: number) => number
+  readAt: (dest: Uint8Array, offset: number) => number,
+  options?: SyncAccessExternalDataProxyOptions
 ): Uint8Array {
   const safeLength = Math.max(0, Math.floor(byteLength));
   const proxy = Object.create(Uint8Array.prototype) as Uint8Array;
+  const scratchPool = options?.scratchPool;
 
   Object.defineProperties(proxy, {
     BYTES_PER_ELEMENT: {
@@ -48,7 +87,7 @@ export function createSyncAccessExternalDataProxy(
           return new Uint8Array(0);
         }
 
-        const out = new Uint8Array(sliceLen);
+        const out = scratchPool ? scratchPool.acquire(sliceLen) : new Uint8Array(sliceLen);
         let filled = 0;
         while (filled < sliceLen) {
           const target = filled === 0 ? out : out.subarray(filled);
@@ -60,7 +99,7 @@ export function createSyncAccessExternalDataProxy(
           }
           filled += bytesRead;
         }
-        return out;
+        return filled === sliceLen ? out : out.subarray(0, filled);
       },
       enumerable: false,
       configurable: true,
@@ -91,6 +130,7 @@ export interface ExternalDataResolveDeps {
 export class ExternalDataSessionBridge {
   private readonly urlByKey = new Map<string, string>();
   private readonly activeHandles = new Set<OpfsSyncReadHandle>();
+  private readonly scratchPool = new ExternalDataScratchPool();
 
   registerUrl(fileNameOrPath: string, url: string): void {
     const clean = fileNameOrPath.replace(/^\.\//, '');
@@ -188,6 +228,7 @@ export class ExternalDataSessionBridge {
       }
     }
     this.activeHandles.clear();
+    this.scratchPool.release();
   }
 
   private closeHandles(handles: OpfsSyncReadHandle[]): void {
@@ -198,6 +239,9 @@ export class ExternalDataSessionBridge {
         // Ignore teardown errors
       }
       this.activeHandles.delete(handle);
+    }
+    if (this.activeHandles.size === 0) {
+      this.scratchPool.release();
     }
   }
 
@@ -211,7 +255,9 @@ export class ExternalDataSessionBridge {
       if (syncHandle) {
         this.activeHandles.add(syncHandle);
         sessionHandles.push(syncHandle);
-        return createSyncAccessExternalDataProxy(syncHandle.byteLength, syncHandle.readAt);
+        return createSyncAccessExternalDataProxy(syncHandle.byteLength, syncHandle.readAt, {
+          scratchPool: this.scratchPool,
+        });
       }
 
       const opfsResp = await readOpfsCachedResponse(deps.opfsRoot, url);
@@ -229,6 +275,20 @@ export class ExternalDataSessionBridge {
         const cache = await storage.open(deps.cacheName);
         const hit = await cache.match(url);
         if (hit) {
+          const hasWorkerFileReaderSync =
+            typeof (globalThis as { FileReaderSync?: unknown }).FileReaderSync === 'function';
+          if (hasWorkerFileReaderSync && typeof hit.blob === 'function') {
+            const blob = await hit.blob();
+            const blobHandle = createBlobSyncReadHandle(blob, url);
+            if (blobHandle) {
+              this.activeHandles.add(blobHandle);
+              sessionHandles.push(blobHandle);
+              return createSyncAccessExternalDataProxy(blobHandle.byteLength, blobHandle.readAt, {
+                scratchPool: this.scratchPool,
+              });
+            }
+            return new Uint8Array(await blob.arrayBuffer());
+          }
           return new Uint8Array(await hit.arrayBuffer());
         }
       } catch {

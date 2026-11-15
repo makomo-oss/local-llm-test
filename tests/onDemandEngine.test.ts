@@ -7,13 +7,20 @@ import {
   parseOnnxEmbedTokensPlan,
 } from '../src/engine/embedTokensSession.ts';
 import {
+  ExternalDataScratchPool,
   ExternalDataSessionBridge,
   createSyncAccessExternalDataProxy,
 } from '../src/engine/externalDataProxy.ts';
-import { classifyModelLoadError } from '../src/engine/llm.worker.ts';
+import {
+  assertStorageQuotaForDownload,
+  assertWebGpuSingleTensorLimit,
+  classifyModelLoadError,
+} from '../src/engine/llm.worker.ts';
 import { createSerializedCacheAdapter } from '../src/engine/modelPrecacher.ts';
 import {
+  openOpfsSyncReadHandle,
   writeResponseToOpfsStore,
+  writeStreamToOpfsStore,
   type OpfsDirectoryLike,
   type OpfsFileHandleLike,
   type OpfsSyncAccessHandleLike,
@@ -892,5 +899,314 @@ describe('WebGPU single-tensor limits, streaming risk & WEBGPU_BUFFER_LIMIT erro
       new Error('GPUBuffer size exceeds maxBufferSize limit')
     );
     expect(res2.code).toBe('WEBGPU_BUFFER_LIMIT');
+
+    const tagged = Object.assign(new Error('limit check'), { code: 'WEBGPU_BUFFER_LIMIT' });
+    expect(classifyModelLoadError(tagged).code).toBe('WEBGPU_BUFFER_LIMIT');
+  });
+
+  it('allows mobile 128 MiB maxStorage + 256 MiB maxBuffer GPUs for split Gemma 4 E2B and validates preflight limits/quota', () => {
+    const gemmaE2b = getModelById('gemma-4-e2b');
+    const gemmaE4b = getModelById('gemma-4-e4b');
+    const qwen08 = getModelById('qwen-3.5-0.8b');
+    const llama3b = getModelById('llama-3.2-3b');
+
+    const mobileSpecGpu = makeWebGpuDevice({
+      maxStorageBufferBindingSize: 134_217_728, // 128 MiB
+      maxBufferSize: 268_435_456, // 256 MiB
+    });
+    const android8gEnv = {
+      userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) Mobile Safari/537.36',
+      deviceMemoryGb: 8,
+    };
+
+    // Gemma 4 E2B (192 MiB MatMulNBits) fits 256 MiB maxBuffer with split storage bindings (no false high block)
+    const e2bResolved = resolveEffectiveDtype(gemmaE2b, mobileSpecGpu, 'q4f16');
+    const e2bRisk = assessModelMemoryRisk(gemmaE2b, e2bResolved, mobileSpecGpu, android8gEnv);
+    expect(e2bRisk.level).toBe('caution');
+    expect(e2bRisk.headline).not.toContain('単一バッファ上限');
+    expect(() => assertWebGpuSingleTensorLimit(gemmaE2b, mobileSpecGpu, e2bResolved)).not.toThrow();
+
+    // Gemma 4 E4B (320 MiB) exceeds 256 MiB maxBuffer -> high risk, alternatives must NOT suggest E4B itself
+    const e4bResolved = resolveEffectiveDtype(gemmaE4b, mobileSpecGpu, 'q4f16');
+    const e4bRisk = assessModelMemoryRisk(gemmaE4b, e4bResolved, mobileSpecGpu, android8gEnv);
+    expect(e4bRisk.level).toBe('high');
+    expect(e4bRisk.detail).toContain('Gemma 4 E2B');
+    expect(e4bRisk.detail).not.toContain('Gemma 4 E4B');
+    expect(() => assertWebGpuSingleTensorLimit(gemmaE4b, mobileSpecGpu, e4bResolved)).toThrow(
+      expect.objectContaining({ code: 'WEBGPU_BUFFER_LIMIT' })
+    );
+
+    // Llama 3.2 3B monolithic Gather requires min(maxStorage, maxBuffer)
+    const llamaResolved = resolveEffectiveDtype(llama3b, mobileSpecGpu, 'q4f16');
+    const hugeBufferTinyStorage = makeWebGpuDevice({
+      maxStorageBufferBindingSize: 134_217_728,
+      maxBufferSize: 2_147_483_648,
+    });
+    expect(() =>
+      assertWebGpuSingleTensorLimit(llama3b, hugeBufferTinyStorage, llamaResolved)
+    ).toThrow(expect.objectContaining({ code: 'WEBGPU_BUFFER_LIMIT' }));
+
+    // When maxBufferSize is 64 MiB (< even Qwen 0.8B 121.3 MiB), detail must advise CPU without broken suggestions
+    const tinyGpu = makeWebGpuDevice({
+      maxStorageBufferBindingSize: 64 * 1024 * 1024,
+      maxBufferSize: 64 * 1024 * 1024,
+    });
+    const tinyQwenRisk = assessModelMemoryRisk(
+      qwen08,
+      resolveEffectiveDtype(qwen08, tinyGpu, 'q4f16'),
+      tinyGpu,
+      android8gEnv
+    );
+    expect(tinyQwenRisk.level).toBe('high');
+    expect(tinyQwenRisk.detail).toBe('CPU (WASM) デバイスへ切り替えてください。');
+
+    // Storage quota preflight fails early with QuotaExceededError naming cached models
+    expect(() =>
+      assertStorageQuotaForDownload(
+        gemmaE2b,
+        e2bResolved,
+        600 * 1024 * 1024,
+        [
+          {
+            modelId: 'qwen-3.5-0.8b',
+            repoId: qwen08.repoId,
+            cached: true,
+            cachedBytes: 580 * 1024 * 1024,
+            fileCount: 4,
+            files: [],
+            lastCheckedAt: Date.now(),
+          },
+        ]
+      )
+    ).toThrow(expect.objectContaining({ name: 'QuotaExceededError', code: 'STORAGE_QUOTA_EXCEEDED' }));
+
+    // Passes when model is already mostly cached or estimate unavailable
+    expect(() =>
+      assertStorageQuotaForDownload(gemmaE2b, e2bResolved, undefined, [])
+    ).not.toThrow();
+    expect(() =>
+      assertStorageQuotaForDownload(
+        gemmaE2b,
+        e2bResolved,
+        600 * 1024 * 1024,
+        [
+          {
+            modelId: 'gemma-4-e2b',
+            repoId: gemmaE2b.repoId,
+            cached: true,
+            cachedBytes: 3_150_000_000,
+            fileCount: 6,
+            files: [],
+            lastCheckedAt: Date.now(),
+          },
+        ]
+      )
+    ).not.toThrow();
+  });
+
+  it('falls back cleanly to createWritable and FileReaderSync when createSyncAccessHandle throws NotSupportedError', async () => {
+    const stored = new Map<string, Uint8Array>();
+    const syncErrRoot: OpfsDirectoryLike = {
+      async getDirectoryHandle() {
+        return syncErrRoot;
+      },
+      async getFileHandle(name: string, options?: { create?: boolean }): Promise<OpfsFileHandleLike> {
+        if (!stored.has(name) && !options?.create) {
+          throw Object.assign(new Error('NotFound'), { name: 'NotFoundError' });
+        }
+        return {
+          async createSyncAccessHandle(): Promise<OpfsSyncAccessHandleLike> {
+            throw Object.assign(new Error('SyncAccessHandle not supported'), {
+              name: 'NotSupportedError',
+            });
+          },
+          async createWritable(): Promise<OpfsWritableStreamLike> {
+            const chunks: Uint8Array[] = [];
+            return {
+              async write(chunk: Uint8Array) {
+                chunks.push(new Uint8Array(chunk));
+              },
+              async close() {
+                stored.set(name, concatBytes(...chunks));
+              },
+              async abort() {
+                chunks.length = 0;
+              },
+            };
+          },
+          async getFile() {
+            const bytes = stored.get(name) ?? new Uint8Array(0);
+            return new Blob([bytes as BlobPart]);
+          },
+        };
+      },
+      async removeEntry(name: string) {
+        stored.delete(name);
+      },
+    };
+
+    const url =
+      'https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/onnx/decoder_model_merged_q4f16.onnx_data';
+    const payload = new Uint8Array([10, 20, 30, 40, 50, 60, 70, 80]);
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(payload.subarray(0, 5));
+        c.enqueue(payload.subarray(5));
+        c.close();
+      },
+    });
+
+    const written = await writeStreamToOpfsStore({
+      opfsRoot: syncErrRoot,
+      url,
+      stream,
+      headers: new Headers({ 'content-length': '8' }),
+      expectedTotalBytes: 8,
+    });
+    expect(written).toBe(8);
+
+    // Without FileReaderSync (e.g. main thread), openOpfsSyncReadHandle returns undefined safely
+    expect(await openOpfsSyncReadHandle(syncErrRoot, url)).toBeUndefined();
+
+    // With Web Worker FileReaderSync available, opens slice reader seamlessly
+    class MockFileReaderSync {
+      readAsArrayBuffer(blob: Blob): ArrayBuffer {
+        const idx = Number((blob as unknown as { __start?: number }).__start ?? 0);
+        const end = Number((blob as unknown as { __end?: number }).__end ?? idx);
+        const data = (blob as unknown as { __bytes?: Uint8Array }).__bytes;
+        return data ? data.slice(idx, end).buffer : new ArrayBuffer(0);
+      }
+    }
+    vi.stubGlobal('FileReaderSync', MockFileReaderSync);
+    try {
+      const patchFileSlice: OpfsDirectoryLike = {
+        ...syncErrRoot,
+        async getDirectoryHandle() {
+          return patchFileSlice;
+        },
+        async getFileHandle(name: string, opts?: { create?: boolean }) {
+          const fh = await syncErrRoot.getFileHandle(name, opts);
+          return {
+            ...fh,
+            async getFile() {
+              const bytes = stored.get(name) ?? new Uint8Array(0);
+              return {
+                size: bytes.byteLength,
+                slice(start = 0, end = bytes.byteLength) {
+                  return {
+                    size: Math.max(0, end - start),
+                    __start: start,
+                    __end: end,
+                    __bytes: bytes,
+                  } as unknown as Blob;
+                },
+                arrayBuffer: async () => bytes.slice().buffer,
+                text: async () => new TextDecoder().decode(bytes),
+              } as unknown as File;
+            },
+          };
+        },
+      } as OpfsDirectoryLike;
+
+      const handle = await openOpfsSyncReadHandle(patchFileSlice, url);
+      expect(handle?.byteLength).toBe(8);
+      const pool = new ExternalDataScratchPool();
+      const proxy = createSyncAccessExternalDataProxy(handle!.byteLength, handle!.readAt, {
+        scratchPool: pool,
+      });
+      const s1 = proxy.subarray(2, 6);
+      expect(Array.from(s1)).toEqual([30, 40, 50, 60]);
+      const s2 = proxy.subarray(0, 3);
+      expect(Array.from(s2)).toEqual([10, 20, 30]);
+      // Shared buffer reused without leaking prior tail
+      expect(s2.buffer).toBe(s1.buffer);
+      pool.release();
+      handle?.close();
+      expect(() => handle?.readAt(new Uint8Array(2), 0)).toThrow(/closed/i);
+
+      // ExternalDataSessionBridge uses CacheStorage Blob + FileReaderSync without calling Response.arrayBuffer()
+      const rawData = new Uint8Array([11, 22, 33, 44, 55, 66]);
+      const arrayBufferSpy = vi.fn(async () => rawData.slice().buffer);
+      const mockCacheStorage: Pick<CacheStorage, 'open'> = {
+        async open() {
+          return {
+            async match() {
+              return {
+                blob: async () =>
+                  ({
+                    size: rawData.byteLength,
+                    slice(start = 0, end = rawData.byteLength) {
+                      return {
+                        size: Math.max(0, end - start),
+                        __start: start,
+                        __end: end,
+                        __bytes: rawData,
+                      } as unknown as Blob;
+                    },
+                  }) as unknown as Blob,
+                arrayBuffer: arrayBufferSpy,
+              } as unknown as Response;
+            },
+          } as unknown as Cache;
+        },
+      };
+      const bridge = new ExternalDataSessionBridge();
+      const cacheUrl =
+        'https://huggingface.co/onnx-community/Qwen3.5-4B-ONNX/resolve/main/onnx/decoder_model_merged_q4f16.onnx_data_1';
+      bridge.registerUrl('decoder_model_merged_q4f16.onnx_data_1', cacheUrl);
+      const sessionOptions: Record<string, unknown> = {
+        externalData: ['decoder_model_merged_q4f16.onnx_data_1'],
+      };
+      const cleanup = await bridge.prepareSessionExternalData(sessionOptions, {
+        opfsRoot: null,
+        cacheName: 'test-cache',
+        cacheStorage: mockCacheStorage,
+      });
+      expect(arrayBufferSpy).not.toHaveBeenCalled();
+      const entries = sessionOptions.externalData as Array<{ path: string; data: Uint8Array }>;
+      expect(entries[0]?.path).toBe('decoder_model_merged_q4f16.onnx_data_1');
+      expect(Array.from(entries[0]!.data.subarray(1, 5))).toEqual([22, 33, 44, 55]);
+      cleanup();
+      bridge.closeAll();
+
+      // QuotaExceededError on createSyncAccessHandle must NOT fall back to createWritable and must clean partials
+      const writableSpy = vi.fn();
+      const quotaStored = new Set<string>();
+      const quotaRoot: OpfsDirectoryLike = {
+        async getDirectoryHandle() {
+          return quotaRoot;
+        },
+        async getFileHandle(name: string): Promise<OpfsFileHandleLike> {
+          quotaStored.add(name);
+          return {
+            async createSyncAccessHandle(): Promise<OpfsSyncAccessHandleLike> {
+              throw Object.assign(new Error('No space left'), { name: 'QuotaExceededError' });
+            },
+            createWritable: writableSpy as unknown as OpfsFileHandleLike['createWritable'],
+            getFile: async () => new Blob([]),
+          };
+        },
+        async removeEntry(name: string) {
+          quotaStored.delete(name);
+        },
+      };
+      await expect(
+        writeStreamToOpfsStore({
+          opfsRoot: quotaRoot,
+          url,
+          stream: new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(new Uint8Array([1, 2]));
+              c.close();
+            },
+          }),
+          headers: new Headers(),
+        })
+      ).rejects.toMatchObject({ name: 'QuotaExceededError' });
+      expect(writableSpy).not.toHaveBeenCalled();
+      expect(quotaStored.size).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
