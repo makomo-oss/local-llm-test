@@ -1,8 +1,12 @@
 import { TRANSFORMERS_CACHE_NAME } from './cacheManager.ts';
 import {
+  clearOpfsResumableEntry,
   isPersistentOpfsCapable,
+  isTransientStreamError,
   openOpfsCachedBlob,
   readOpfsCachedResponse,
+  readOpfsResumableEntry,
+  readStreamChunks,
   resolveOpfsRootDirectory,
   shouldPreferPersistentOpfs,
   writeResponseToOpfsStore,
@@ -83,6 +87,8 @@ export interface VirtualizeExternalDataOptions {
   shouldVirtualize?: (url: string) => boolean;
   /** Allow virtualizing CacheStorage hits (not only OPFS), e.g. for on-demand sessions. */
   allowCacheStorage?: (url: string) => boolean;
+  /** Allow virtualizing uncached URLs (served remotely via HTTP Range) when storage quota is tight. */
+  allowRemoteFallback?: (url: string) => boolean;
   /** Invoked whenever a virtualized `.onnx_data*` hit is returned to Transformers.js. */
   onMatched?: (fileName: string, url: string) => void;
 }
@@ -326,7 +332,7 @@ export async function streamResponseToCache(
     ...(knownTotal !== undefined ? { total: knownTotal, progress: 0 } : {}),
   });
 
-  if (!response.body || typeof TransformStream === 'undefined') {
+  if (!response.body || typeof ReadableStream === 'undefined') {
     try {
       await cache.put(cacheKey, response);
     } catch (err) {
@@ -346,51 +352,74 @@ export async function streamResponseToCache(
   let loadedBytes = 0;
   let lastEmitAt = 0;
   let lastEmittedBytes = 0;
+  let bytesSinceYield = 0;
   const byteDeltaThreshold =
     knownTotal !== undefined && knownTotal > 0
       ? Math.max(MIN_PROGRESS_BYTE_DELTA, Math.floor(knownTotal * 0.01))
       : MIN_PROGRESS_BYTE_DELTA;
 
-  const meter = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      loadedBytes += chunk.byteLength;
-      controller.enqueue(chunk);
+  const reader = response.body.getReader();
+  const meteredStream = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            const total =
+              knownTotal !== undefined && knownTotal >= loadedBytes ? knownTotal : loadedBytes;
+            onFileProgress?.({
+              status: 'done',
+              name,
+              file: filePath,
+              loaded: loadedBytes,
+              total,
+              progress: 100,
+            });
+            controller.close();
+            return;
+          }
+          if (value && value.byteLength > 0) {
+            loadedBytes += value.byteLength;
+            bytesSinceYield += value.byteLength;
+            controller.enqueue(value);
 
-      if (onFileProgress) {
-        const now = nowFn();
-        if (
-          now - lastEmitAt >= minEmitIntervalMs ||
-          loadedBytes - lastEmittedBytes >= byteDeltaThreshold
-        ) {
-          lastEmitAt = now;
-          lastEmittedBytes = loadedBytes;
-          const total = knownTotal !== undefined && knownTotal >= loadedBytes ? knownTotal : undefined;
-          onFileProgress({
-            status: 'progress',
-            name,
-            file: filePath,
-            loaded: loadedBytes,
-            ...(total !== undefined
-              ? { total, progress: Math.min(100, (loadedBytes / total) * 100) }
-              : {}),
-          });
+            if (onFileProgress) {
+              const now = nowFn();
+              if (
+                now - lastEmitAt >= minEmitIntervalMs ||
+                loadedBytes - lastEmittedBytes >= byteDeltaThreshold
+              ) {
+                lastEmitAt = now;
+                lastEmittedBytes = loadedBytes;
+                const total =
+                  knownTotal !== undefined && knownTotal >= loadedBytes ? knownTotal : undefined;
+                onFileProgress({
+                  status: 'progress',
+                  name,
+                  file: filePath,
+                  loaded: loadedBytes,
+                  ...(total !== undefined
+                    ? { total, progress: Math.min(100, (loadedBytes / total) * 100) }
+                    : {}),
+                });
+              }
+            }
+
+            if (bytesSinceYield >= 16 * 1024 * 1024) {
+              bytesSinceYield = 0;
+              await new Promise<void>((resolve) => setTimeout(resolve, 0));
+            }
+            return;
+          }
         }
-      }
+      },
+      async cancel(reason) {
+        await reader.cancel(reason).catch(() => {});
+      },
     },
-    flush() {
-      const total = knownTotal !== undefined && knownTotal >= loadedBytes ? knownTotal : loadedBytes;
-      onFileProgress?.({
-        status: 'done',
-        name,
-        file: filePath,
-        loaded: loadedBytes,
-        total,
-        progress: 100,
-      });
-    },
-  });
+    { highWaterMark: 1 }
+  );
 
-  const meteredStream = response.body.pipeThrough(meter);
   const headers = buildPrecachedResponseHeaders(response.headers, knownTotal);
   const streamedResponse = new Response(meteredStream, {
     status: 200,
@@ -401,6 +430,7 @@ export async function streamResponseToCache(
   try {
     await cache.put(cacheKey, streamedResponse);
   } catch (err) {
+    await reader.cancel(err).catch(() => {});
     throw wrapCacheWriteError(err, filePath);
   }
 
@@ -461,6 +491,10 @@ async function streamResponseToPersistentOpfs(options: {
   response: Response;
   name: string;
   filePath: string;
+  expectedTotalBytes?: number;
+  resumeFromBytes?: number;
+  keepPartialOnFailure?: boolean;
+  etag?: string;
   signal?: AbortSignal;
   onFileProgress?: (info: PrecacheFileProgressInfo) => void;
   minEmitIntervalMs?: number;
@@ -472,21 +506,32 @@ async function streamResponseToPersistentOpfs(options: {
     response,
     name,
     filePath,
+    expectedTotalBytes,
+    resumeFromBytes = 0,
+    keepPartialOnFailure = false,
+    etag,
     signal,
     onFileProgress,
     minEmitIntervalMs = DEFAULT_EMIT_INTERVAL_MS,
     nowFn = () => Date.now(),
   } = options;
 
-  const knownTotal = resolveExpectedContentLength(response.headers);
+  const knownTotal = expectedTotalBytes ?? resolveExpectedContentLength(response.headers);
   const headers = buildPrecachedResponseHeaders(response.headers, knownTotal);
+  const resumeOffset =
+    Number.isFinite(resumeFromBytes) && resumeFromBytes > 0 ? Math.floor(resumeFromBytes) : 0;
 
   onFileProgress?.({
     status: 'initiate',
     name,
     file: filePath,
-    loaded: 0,
-    ...(knownTotal !== undefined ? { total: knownTotal, progress: 0 } : {}),
+    loaded: resumeOffset,
+    ...(knownTotal !== undefined
+      ? {
+          total: knownTotal,
+          progress: knownTotal > 0 ? Math.min(100, (resumeOffset / knownTotal) * 100) : 0,
+        }
+      : {}),
   });
 
   if (!response.body) {
@@ -505,12 +550,15 @@ async function streamResponseToPersistentOpfs(options: {
       if (err instanceof DOMException && err.name === 'AbortError') {
         throw err;
       }
+      if (isTransientStreamError(err)) {
+        throw err;
+      }
       throw wrapCacheWriteError(err, filePath);
     }
   }
 
   let lastEmitAt = 0;
-  let lastEmittedBytes = 0;
+  let lastEmittedBytes = resumeOffset;
   const byteDeltaThreshold =
     knownTotal !== undefined && knownTotal > 0
       ? Math.max(MIN_PROGRESS_BYTE_DELTA, Math.floor(knownTotal * 0.01))
@@ -523,6 +571,9 @@ async function streamResponseToPersistentOpfs(options: {
       stream: response.body,
       headers,
       expectedTotalBytes: knownTotal,
+      resumeFromBytes: resumeOffset,
+      keepPartialOnFailure,
+      etag,
       signal,
       onProgress: (loadedBytes) => {
         if (!onFileProgress) {
@@ -562,6 +613,9 @@ async function streamResponseToPersistentOpfs(options: {
     return written;
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
+      throw err;
+    }
+    if (isTransientStreamError(err)) {
       throw err;
     }
     throw wrapCacheWriteError(err, filePath);
@@ -624,7 +678,6 @@ async function streamResponseViaOpfsOrDirectCache(
           ...(knownTotal !== undefined ? { total: knownTotal, progress: 0 } : {}),
         });
 
-        const reader = response.body.getReader();
         let loadedBytes = 0;
         let lastEmitAt = 0;
         let lastEmittedBytes = 0;
@@ -633,54 +686,47 @@ async function streamResponseViaOpfsOrDirectCache(
             ? Math.max(MIN_PROGRESS_BYTE_DELTA, Math.floor(knownTotal * 0.01))
             : MIN_PROGRESS_BYTE_DELTA;
 
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-              break;
-            }
-            if (value && value.byteLength > 0) {
-              if (accessHandle) {
-                let written = 0;
-                while (written < value.byteLength) {
-                  const n = accessHandle.write(value.subarray(written), { at: loadedBytes + written });
-                  if (n <= 0) {
-                    throw new Error(`OPFS write failed at offset ${loadedBytes + written} for ${filePath}`);
-                  }
-                  written += n;
+        await readStreamChunks(response.body, {
+          onChunk: async (value) => {
+            if (accessHandle) {
+              let written = 0;
+              while (written < value.byteLength) {
+                const n = accessHandle.write(value.subarray(written), { at: loadedBytes + written });
+                if (n <= 0) {
+                  throw new Error(
+                    `OPFS write failed at offset ${loadedBytes + written} for ${filePath}`
+                  );
                 }
-              } else if (writable) {
-                await writable.write(value);
+                written += n;
               }
-              loadedBytes += value.byteLength;
+            } else if (writable) {
+              await writable.write(value);
+            }
+            loadedBytes += value.byteLength;
 
-              if (onFileProgress) {
-                const now = nowFn();
-                if (
-                  now - lastEmitAt >= minEmitIntervalMs ||
-                  loadedBytes - lastEmittedBytes >= byteDeltaThreshold
-                ) {
-                  lastEmitAt = now;
-                  lastEmittedBytes = loadedBytes;
-                  const total =
-                    knownTotal !== undefined && knownTotal >= loadedBytes ? knownTotal : undefined;
-                  onFileProgress({
-                    status: 'progress',
-                    name,
-                    file: filePath,
-                    loaded: loadedBytes,
-                    ...(total !== undefined
-                      ? { total, progress: Math.min(100, (loadedBytes / total) * 100) }
-                      : {}),
-                  });
-                }
+            if (onFileProgress) {
+              const now = nowFn();
+              if (
+                now - lastEmitAt >= minEmitIntervalMs ||
+                loadedBytes - lastEmittedBytes >= byteDeltaThreshold
+              ) {
+                lastEmitAt = now;
+                lastEmittedBytes = loadedBytes;
+                const total =
+                  knownTotal !== undefined && knownTotal >= loadedBytes ? knownTotal : undefined;
+                onFileProgress({
+                  status: 'progress',
+                  name,
+                  file: filePath,
+                  loaded: loadedBytes,
+                  ...(total !== undefined
+                    ? { total, progress: Math.min(100, (loadedBytes / total) * 100) }
+                    : {}),
+                });
               }
             }
-          }
-        } catch (err) {
-          await reader.cancel().catch(() => {});
-          throw err;
-        }
+          },
+        });
 
         if (accessHandle) {
           accessHandle.flush();
@@ -852,73 +898,179 @@ export async function precacheModelFilesSequentially(
       await cache.delete?.(url).catch(() => false);
     }
 
-    const response = await fetchFn(
-      url,
-      options.signal ? { signal: options.signal } : undefined
-    );
+    const initialPartial =
+      persistentOpfsReady && opfsRoot ? await readOpfsResumableEntry(opfsRoot, url) : null;
+    const initialResumeOffset = initialPartial?.byteOffset ?? 0;
+    let fileWrittenBytes = -1;
 
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      if (response.status === 404 && isOptionalModelFile(filePath)) {
+    for (let attempt = 0; attempt < MAX_TRANSIENT_DOWNLOAD_ATTEMPTS; attempt += 1) {
+      if (options.signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+
+      const partial =
+        attempt === 0
+          ? initialPartial
+          : persistentOpfsReady && opfsRoot
+            ? await readOpfsResumableEntry(opfsRoot, url)
+            : null;
+      const fetchInit: RequestInit = {};
+      let hasFetchInit = false;
+      if (options.signal) {
+        fetchInit.signal = options.signal;
+        hasFetchInit = true;
+      }
+      if (partial) {
+        fetchInit.headers = { Range: `bytes=${partial.byteOffset}-` };
+        hasFetchInit = true;
+      }
+
+      let response: Response;
+      try {
+        response = await fetchFn(url, hasFetchInit ? fetchInit : undefined);
+      } catch (fetchErr) {
+        if (
+          !isTransientFetchOrStreamError(fetchErr) ||
+          attempt >= MAX_TRANSIENT_DOWNLOAD_ATTEMPTS - 1
+        ) {
+          throw fetchErr;
+        }
+        await sleepBeforeRetry(150 * (attempt + 1), options.signal);
         continue;
       }
-      throw new Error(
-        `モデルファイルの取得に失敗しました (${response.status} ${response.statusText || 'HTTP Error'}): ${filePath}`
-      );
+
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {});
+        if (partial && response.status === 416) {
+          await clearOpfsResumableEntry(opfsRoot, url);
+          continue;
+        }
+        if (response.status === 404 && isOptionalModelFile(filePath)) {
+          fileWrittenBytes = -1;
+          break;
+        }
+        if (
+          isTransientDownloadStatus(response.status) &&
+          attempt < MAX_TRANSIENT_DOWNLOAD_ATTEMPTS - 1
+        ) {
+          await sleepBeforeRetry(150 * (attempt + 1), options.signal);
+          continue;
+        }
+        throw new Error(
+          `モデルファイルの取得に失敗しました (${response.status} ${response.statusText || 'HTTP Error'}): ${filePath}`
+        );
+      }
+
+      let resumeFromBytes = 0;
+      let totalExpectedBytes = resolveExpectedContentLength(response.headers);
+      const responseEtag = response.headers.get('etag')?.trim() || undefined;
+
+      if (partial) {
+        if (response.status === 206) {
+          const parsedRange = parseContentRangeHeader(response.headers.get('content-range'));
+          const etagMismatch = Boolean(
+            partial.etag && responseEtag && partial.etag !== responseEtag
+          );
+          if (!parsedRange || parsedRange.start !== partial.byteOffset || etagMismatch) {
+            await response.body?.cancel().catch(() => {});
+            await clearOpfsResumableEntry(opfsRoot, url);
+            if (attempt < MAX_TRANSIENT_DOWNLOAD_ATTEMPTS - 1) {
+              continue;
+            }
+            throw new Error(
+              `レジューム検証に失敗しました (Content-Range/ETag mismatch): ${filePath}`
+            );
+          }
+          resumeFromBytes = partial.byteOffset;
+          totalExpectedBytes =
+            parsedRange.total ??
+            partial.totalBytes ??
+            (totalExpectedBytes !== undefined
+              ? partial.byteOffset + totalExpectedBytes
+              : undefined);
+        } else {
+          // Server returned full 200 OK instead of 206; reset and write from byte 0.
+          await clearOpfsResumableEntry(opfsRoot, url);
+          resumeFromBytes = 0;
+        }
+      }
+
+      const storeInPersistentOpfs =
+        persistentOpfsReady &&
+        (!cache ||
+          !canStreamPut ||
+          shouldPreferPersistentOpfs(filePath, totalExpectedBytes));
+
+      try {
+        if (storeInPersistentOpfs && opfsRoot) {
+          fileWrittenBytes = await streamResponseToPersistentOpfs({
+            opfsRoot,
+            url,
+            response,
+            name: options.repoId,
+            filePath,
+            expectedTotalBytes: totalExpectedBytes,
+            resumeFromBytes,
+            keepPartialOnFailure: true,
+            etag: responseEtag ?? partial?.etag,
+            signal: options.signal,
+            onFileProgress: options.onFileProgress,
+            minEmitIntervalMs: options.minEmitIntervalMs,
+            nowFn: options.nowFn,
+          });
+        } else if (cache && canStreamPut) {
+          if (partial) {
+            await clearOpfsResumableEntry(opfsRoot, url);
+          }
+          fileWrittenBytes = await streamResponseToCache({
+            cache,
+            cacheKey: url,
+            response,
+            name: options.repoId,
+            filePath,
+            expectedTotalBytes: totalExpectedBytes,
+            onFileProgress: options.onFileProgress,
+            minEmitIntervalMs: options.minEmitIntervalMs,
+            nowFn: options.nowFn,
+          });
+        } else if (cache) {
+          if (partial) {
+            await clearOpfsResumableEntry(opfsRoot, url);
+          }
+          fileWrittenBytes = await streamResponseViaOpfsOrDirectCache({
+            cache,
+            cacheKey: url,
+            response,
+            name: options.repoId,
+            filePath,
+            expectedTotalBytes: totalExpectedBytes,
+            onFileProgress: options.onFileProgress,
+            minEmitIntervalMs: options.minEmitIntervalMs,
+            nowFn: options.nowFn,
+            opfsRoot,
+          });
+        } else {
+          throw wrapCacheWriteError(
+            new Error('利用可能なブラウザストレージがありません。'),
+            filePath
+          );
+        }
+        break;
+      } catch (streamErr) {
+        if (isTransientStreamError(streamErr) && attempt < MAX_TRANSIENT_DOWNLOAD_ATTEMPTS - 1) {
+          await sleepBeforeRetry(150 * (attempt + 1), options.signal);
+          continue;
+        }
+        throw streamErr;
+      }
     }
 
-    const responseExpectedBytes = resolveExpectedContentLength(response.headers);
-    const storeInPersistentOpfs =
-      persistentOpfsReady &&
-      (!cache ||
-        !canStreamPut ||
-        shouldPreferPersistentOpfs(filePath, responseExpectedBytes));
-
-    let written: number;
-    if (storeInPersistentOpfs && opfsRoot) {
-      written = await streamResponseToPersistentOpfs({
-        opfsRoot,
-        url,
-        response,
-        name: options.repoId,
-        filePath,
-        signal: options.signal,
-        onFileProgress: options.onFileProgress,
-        minEmitIntervalMs: options.minEmitIntervalMs,
-        nowFn: options.nowFn,
-      });
-    } else if (cache && canStreamPut) {
-      written = await streamResponseToCache({
-        cache,
-        cacheKey: url,
-        response,
-        name: options.repoId,
-        filePath,
-        onFileProgress: options.onFileProgress,
-        minEmitIntervalMs: options.minEmitIntervalMs,
-        nowFn: options.nowFn,
-      });
-    } else if (cache) {
-      written = await streamResponseViaOpfsOrDirectCache({
-        cache,
-        cacheKey: url,
-        response,
-        name: options.repoId,
-        filePath,
-        onFileProgress: options.onFileProgress,
-        minEmitIntervalMs: options.minEmitIntervalMs,
-        nowFn: options.nowFn,
-        opfsRoot,
-      });
-    } else {
-      throw wrapCacheWriteError(
-        new Error('利用可能なブラウザストレージがありません。'),
-        filePath
-      );
+    if (fileWrittenBytes < 0) {
+      continue;
     }
 
     downloadedFiles += 1;
-    downloadedBytes += written;
+    downloadedBytes += Math.max(0, fileWrittenBytes - initialResumeOffset);
   }
 
   return {
@@ -933,6 +1085,70 @@ export async function precacheModelFilesSequentially(
 function isOnnxExternalDataUrl(url: string): boolean {
   const cleanUrl = (url.split('#')[0]?.split('?')[0] ?? url).trim();
   return /\.onnx_data(?:_\d+)?$/i.test(cleanUrl);
+}
+
+const MAX_TRANSIENT_DOWNLOAD_ATTEMPTS = 3;
+
+function parseContentRangeHeader(
+  raw: string | null
+): { start: number; end: number; total?: number } | null {
+  if (!raw) {
+    return null;
+  }
+  const match = /^\s*bytes\s+(\d+)-(\d+)\/(\d+|\*)\s*$/i.exec(raw);
+  if (!match) {
+    return null;
+  }
+  const start = Number.parseInt(match[1]!, 10);
+  const end = Number.parseInt(match[2]!, 10);
+  const total = match[3] === '*' ? undefined : Number.parseInt(match[3]!, 10);
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    end < start ||
+    (total !== undefined && (!Number.isSafeInteger(total) || end >= total))
+  ) {
+    return null;
+  }
+  return { start, end, ...(total !== undefined ? { total } : {}) };
+}
+
+function isTransientDownloadStatus(status: number): boolean {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function isTransientFetchOrStreamError(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === 'AbortError') {
+    return false;
+  }
+  if (isQuotaExceededError(err)) {
+    return false;
+  }
+  if (err && typeof err === 'object') {
+    const code = (err as { code?: unknown }).code;
+    if (code === 'STORAGE_QUOTA_EXCEEDED' || code === 'STORAGE_WRITE_FAILED') {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function sleepBeforeRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function extractExternalDataFileName(url: string): string {
@@ -954,7 +1170,8 @@ export function createSerializedCacheAdapter(
   const opfsRoot = adapterOptions.opfsRoot ?? null;
   const persistentOpfsReady = isPersistentOpfsCapable(opfsRoot);
   const virtualizeConfig = adapterOptions.virtualizeExternalData;
-  if ((!storage || typeof storage.open !== 'function') && !persistentOpfsReady) {
+  const hasRemoteFallback = Boolean(virtualizeConfig?.allowRemoteFallback);
+  if ((!storage || typeof storage.open !== 'function') && !persistentOpfsReady && !hasRemoteFallback) {
     return null;
   }
 
@@ -1016,24 +1233,31 @@ export function createSerializedCacheAdapter(
           }
         }
         const bucketPromise = getBucket();
-        if (!bucketPromise) {
-          return undefined;
-        }
-        try {
-          const cache = await bucketPromise;
-          const cacheHit = await cache.match(request, options);
-          if (
-            cacheHit &&
-            shouldVirtualize &&
-            virtualizeConfig.allowCacheStorage?.(urlStr)
-          ) {
-            virtualizeConfig.onMatched?.(extractExternalDataFileName(urlStr), urlStr);
-            return urlStr as unknown as Response;
+        if (bucketPromise) {
+          try {
+            const cache = await bucketPromise;
+            const cacheHit = await cache.match(request, options);
+            if (
+              cacheHit &&
+              shouldVirtualize &&
+              virtualizeConfig.allowCacheStorage?.(urlStr)
+            ) {
+              virtualizeConfig.onMatched?.(extractExternalDataFileName(urlStr), urlStr);
+              return urlStr as unknown as Response;
+            }
+            if (cacheHit) {
+              return cacheHit;
+            }
+          } catch {
+            // Fall through to remote fallback check or undefined
           }
-          return cacheHit;
-        } catch {
-          return undefined;
         }
+
+        if (shouldVirtualize && virtualizeConfig.allowRemoteFallback?.(urlStr)) {
+          virtualizeConfig.onMatched?.(extractExternalDataFileName(urlStr), urlStr);
+          return urlStr as unknown as Response;
+        }
+        return undefined;
       });
     },
     async put(request: RequestInfo | URL, response: Response): Promise<void> {

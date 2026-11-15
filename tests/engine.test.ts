@@ -24,6 +24,7 @@ import {
   probeStreamingCachePutSupport,
   resolveExpectedContentLength,
   resolveExternalDataAugmentedConfig,
+  streamResponseToCache,
 } from '../src/engine/modelPrecacher.ts';
 import {
   LlmRuntimeClient,
@@ -37,6 +38,8 @@ import {
   clearOpfsModelEntries,
   inspectOpfsModelEntries,
   readOpfsCachedResponse,
+  readOpfsResumableEntry,
+  readStreamChunks,
   shouldPreferPersistentOpfs,
   writeResponseToOpfsStore,
   writeStreamToOpfsStore,
@@ -1792,5 +1795,256 @@ describe('Mobile OPFS persistence, session serialization & worker lifecycle', ()
     });
     expect(readyToInit?.stage).toBe('initializing-session');
     expect(readyToInit?.overallProgressPct).toBe(99);
+  });
+
+  it('reuses a single BYOB staging ArrayBuffer for byte streams, supports default-reader fallback, and handles aborts', async () => {
+    const payload = new Uint8Array(20_000);
+    for (let i = 0; i < payload.length; i += 1) {
+      payload[i] = (i * 13 + 7) & 0xff;
+    }
+
+    let offset = 0;
+    const byteStream = new ReadableStream({
+      type: 'bytes',
+      pull(controller) {
+        if (offset >= payload.length) {
+          controller.close();
+          controller.byobRequest?.respond(0);
+          return;
+        }
+        const byobRequest = controller.byobRequest;
+        const view = byobRequest?.view;
+        if (byobRequest && view) {
+          const target = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+          const n = Math.min(target.byteLength, payload.length - offset);
+          target.set(payload.subarray(offset, offset + n));
+          offset += n;
+          byobRequest.respond(n);
+        } else {
+          const end = Math.min(payload.length, offset + 2500);
+          controller.enqueue(payload.slice(offset, end));
+          offset = end;
+        }
+      },
+    } as UnderlyingByteSource) as unknown as ReadableStream<Uint8Array>;
+
+    const observedBuffers: ArrayBufferLike[] = [];
+    const receivedByob: number[] = [];
+    await readStreamChunks(byteStream, {
+      stagingBytes: 4096,
+      onChunk(chunk) {
+        observedBuffers.push(chunk.buffer);
+        for (let i = 0; i < chunk.byteLength; i += 1) {
+          receivedByob.push(chunk[i]!);
+        }
+      },
+    });
+    expect(observedBuffers.length).toBeGreaterThan(1);
+    // BYOB transfers the single backing store on every read so prior wrappers are immediately detached (0 live bytes accumulated).
+    for (const prevBuf of observedBuffers.slice(0, -1)) {
+      expect((prevBuf as { detached?: boolean }).detached).toBe(true);
+    }
+    expect(Uint8Array.from(receivedByob)).toEqual(payload);
+
+    // Non-byte stream fallback & abort propagation
+    const ac = new AbortController();
+    const receivedFallback: number[] = [];
+    await readStreamChunks(makeChunkedStream([payload.subarray(0, 100), payload.subarray(100, 250)]), {
+      onChunk(chunk) {
+        receivedFallback.push(...chunk);
+      },
+    });
+    expect(Uint8Array.from(receivedFallback)).toEqual(payload.subarray(0, 250));
+
+    ac.abort();
+    await expect(
+      readStreamChunks(makeChunkedStream([new Uint8Array([1, 2, 3])]), {
+        signal: ac.signal,
+        onChunk() {},
+      })
+    ).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('streams Cache.put via pull-backpressured ReadableStream without TransformStream', async () => {
+    const stored = new Map<string, Uint8Array>();
+    const mockCache: Cache = {
+      match: vi.fn(async () => undefined),
+      put: vi.fn(async (req: RequestInfo | URL, res: Response) => {
+        stored.set(String(req), new Uint8Array(await res.arrayBuffer()));
+      }),
+      delete: vi.fn(async () => true),
+      keys: vi.fn(async () => []),
+    } as unknown as Cache;
+
+    const events: string[] = [];
+    const totalWritten = await streamResponseToCache({
+      cache: mockCache,
+      cacheKey: 'https://huggingface.co/test/tokenizer.json',
+      response: new Response(
+        makeChunkedStream([new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])]),
+        { status: 200, headers: { 'content-length': '5' } }
+      ),
+      name: 'test',
+      filePath: 'tokenizer.json',
+      minEmitIntervalMs: 0,
+      onFileProgress: (ev) => events.push(`${ev.status}:${ev.loaded}`),
+    });
+
+    expect(totalWritten).toBe(5);
+    expect(Array.from(stored.get('https://huggingface.co/test/tokenizer.json')!)).toEqual([
+      1, 2, 3, 4, 5,
+    ]);
+    expect(events).toEqual(['initiate:0', 'progress:3', 'progress:5', 'done:5']);
+  });
+
+  it('resumes interrupted OPFS downloads via HTTP 206 Range and handles 416/200/ETag reset & partial cache clearing', async () => {
+    const repoId = 'onnx-community/gemma-4-E2B-it-ONNX';
+    const filePath = 'onnx/decoder_model_merged_q4f16.onnx_data';
+    const url = buildRemoteModelFileUrl(repoId, filePath);
+    const fullBytes = new Uint8Array([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+
+    const { root: opfsRoot, tree } = createInMemoryOpfsRoot({ supportsSyncAccess: true });
+    let fetchCount = 0;
+    const rangeHeaders: Array<string | null> = [];
+
+    const transientFetch = vi.fn(async (_u: RequestInfo | URL, init?: RequestInit) => {
+      fetchCount += 1;
+      const reqHeaders = new Headers(init?.headers);
+      rangeHeaders.push(reqHeaders.get('Range'));
+
+      if (fetchCount === 1) {
+        // Attempt 1: send 4 bytes then fail mid-stream cleanly/error
+        let sent = false;
+        const brokenStream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (!sent) {
+              sent = true;
+              controller.enqueue(fullBytes.subarray(0, 4));
+              return;
+            }
+            controller.error(new TypeError('network connection lost'));
+          },
+        });
+        return new Response(brokenStream, {
+          status: 200,
+          headers: { 'content-length': String(fullBytes.length), etag: '"v1"' },
+        });
+      }
+
+      // Attempt 2: honor Range: bytes=4- and deliver remaining 6 bytes via 206
+      return new Response(makeChunkedStream([fullBytes.subarray(4, 7), fullBytes.subarray(7)]), {
+        status: 206,
+        headers: {
+          'content-length': '6',
+          'content-range': 'bytes 4-9/10',
+          etag: '"v1"',
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const resumedRes = await precacheModelFilesSequentially({
+      repoId,
+      files: [filePath],
+      opfsRoot,
+      fetchFn: transientFetch,
+      minEmitIntervalMs: 0,
+    });
+    expect(resumedRes.downloadedFiles).toBe(1);
+    expect(resumedRes.downloadedBytes).toBe(fullBytes.length);
+    expect(rangeHeaders).toEqual([null, 'bytes=4-']);
+
+    const cachedHit = await readOpfsCachedResponse(opfsRoot, url);
+    expect(cachedHit).toBeDefined();
+    expect(new Uint8Array(await cachedHit!.arrayBuffer())).toEqual(fullBytes);
+    expect(await readOpfsResumableEntry(opfsRoot, url)).toBeNull();
+
+    // Cross-attempt partial followed by ETag mismatch must clear partial and restart from 0 cleanly
+    const stem = buildOpfsEntryStem(url);
+    const cacheDirNode = tree.dirs.get(OPFS_MODEL_CACHE_DIR)!;
+    cacheDirNode.files.delete(`${stem}.meta.json`);
+    cacheDirNode.files.set(`${stem}.bin`, fullBytes.subarray(0, 5));
+    cacheDirNode.files.set(
+      `${stem}.partial.json`,
+      new TextEncoder().encode(
+        JSON.stringify({ url, bytes: 5, totalBytes: 10, etag: '"old"', headers: [], updatedAt: 1 })
+      )
+    );
+    expect(await readOpfsResumableEntry(opfsRoot, url)).toMatchObject({ byteOffset: 5, etag: '"old"' });
+
+    // clearOpfsModelEntries reclaims incomplete partial downloads accurately
+    const clearedPartial = await clearOpfsModelEntries(opfsRoot, repoId);
+    expect(clearedPartial).toEqual({ clearedBytes: 5, deletedEntries: 1 });
+    expect(cacheDirNode.files.size).toBe(0);
+
+    // Seed partial again and test server returning ETag mismatch on 206 -> full 200 retry from byte 0
+    cacheDirNode.files.set(`${stem}.bin`, fullBytes.subarray(0, 5));
+    cacheDirNode.files.set(
+      `${stem}.partial.json`,
+      new TextEncoder().encode(
+        JSON.stringify({ url, bytes: 5, totalBytes: 10, etag: '"old"', headers: [], updatedAt: 1 })
+      )
+    );
+
+    const etagSeq: Array<string | null> = [];
+    const mismatchFetch = vi.fn(async (_u: RequestInfo | URL, init?: RequestInit) => {
+      const range = new Headers(init?.headers).get('Range');
+      etagSeq.push(range);
+      if (range) {
+        return new Response(fullBytes.subarray(5), {
+          status: 206,
+          headers: { 'content-range': 'bytes 5-9/10', etag: '"new"' },
+        });
+      }
+      return new Response(fullBytes, {
+        status: 200,
+        headers: { 'content-length': String(fullBytes.length), etag: '"new"' },
+      });
+    }) as unknown as typeof fetch;
+
+    await precacheModelFilesSequentially({
+      repoId,
+      files: [filePath],
+      opfsRoot,
+      fetchFn: mismatchFetch,
+    });
+    expect(etagSeq).toEqual(['bytes=5-', null]);
+    expect(new Uint8Array(await (await readOpfsCachedResponse(opfsRoot, url))!.arrayBuffer())).toEqual(
+      fullBytes
+    );
+
+    // Premature clean EOF (< Content-Length) must also preserve partial and resume via 206 Range
+    await clearOpfsModelEntries(opfsRoot, repoId);
+    let truncCall = 0;
+    const truncFetch = vi.fn(async (_u: RequestInfo | URL, init?: RequestInit) => {
+      truncCall += 1;
+      const range = new Headers(init?.headers).get('Range');
+      if (truncCall === 1) {
+        expect(range).toBeNull();
+        return new Response(makeChunkedStream([fullBytes.subarray(0, 6)]), {
+          status: 200,
+          headers: { 'content-length': String(fullBytes.length), etag: '"trunc1"' },
+        });
+      }
+      expect(range).toBe('bytes=6-');
+      return new Response(makeChunkedStream([fullBytes.subarray(6)]), {
+        status: 206,
+        headers: {
+          'content-length': '4',
+          'content-range': 'bytes 6-9/10',
+          etag: '"trunc1"',
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    await precacheModelFilesSequentially({
+      repoId,
+      files: [filePath],
+      opfsRoot,
+      fetchFn: truncFetch,
+    });
+    expect(truncCall).toBe(2);
+    expect(new Uint8Array(await (await readOpfsCachedResponse(opfsRoot, url))!.arrayBuffer())).toEqual(
+      fullBytes
+    );
   });
 });

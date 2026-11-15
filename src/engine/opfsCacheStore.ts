@@ -39,6 +39,28 @@ export interface OpfsStoredEntryMeta {
   savedAt: number;
 }
 
+export interface OpfsPartialEntryMeta {
+  url: string;
+  bytes: number;
+  totalBytes?: number;
+  etag?: string;
+  headers: Array<[string, string]>;
+  updatedAt: number;
+}
+
+export interface OpfsResumableEntry {
+  byteOffset: number;
+  totalBytes?: number;
+  etag?: string;
+}
+
+export interface ReadStreamChunksOptions {
+  signal?: AbortSignal;
+  stagingBytes?: number;
+  yieldEveryBytes?: number;
+  onChunk: (chunk: Uint8Array) => Promise<void> | void;
+}
+
 export interface OpfsInspectedEntry {
   url: string;
   file: string;
@@ -50,8 +72,35 @@ export interface OpfsClearResult {
   deletedEntries: number;
 }
 
+export const STREAM_READ_BUFFER_BYTES = 512 * 1024; // 512 KiB reusable staging buffer
+const DEFAULT_STREAM_YIELD_INTERVAL_BYTES = 16 * 1024 * 1024;
 const META_SUFFIX = '.meta.json';
+const PARTIAL_SUFFIX = '.partial.json';
 const BIN_SUFFIX = '.bin';
+
+export function isTransientStreamError(err: unknown): boolean {
+  return Boolean(
+    err &&
+      typeof err === 'object' &&
+      (err as { isTransientStreamError?: unknown }).isTransientStreamError === true
+  );
+}
+
+function markTransientStreamError(err: unknown): unknown {
+  if (err && typeof err === 'object' && !(err instanceof DOMException && err.name === 'AbortError')) {
+    try {
+      Object.defineProperty(err, 'isTransientStreamError', {
+        value: true,
+        configurable: true,
+        enumerable: false,
+        writable: true,
+      });
+    } catch {
+      // Ignore frozen error objects
+    }
+  }
+  return err;
+}
 
 /**
  * Resolve OPFS root directory safely when available in the current execution context.
@@ -215,6 +264,231 @@ async function readOpfsMetaFile(
   } catch {
     return null;
   }
+}
+
+async function readOpfsPartialMetaFile(
+  dir: OpfsDirectoryLike,
+  partialFileName: string
+): Promise<OpfsPartialEntryMeta | null> {
+  try {
+    const handle = await dir.getFileHandle(partialFileName, { create: false });
+    const file = await handle.getFile();
+    const raw = await file.text();
+    const parsed = JSON.parse(raw) as Partial<OpfsPartialEntryMeta>;
+    if (
+      typeof parsed?.url !== 'string' ||
+      typeof parsed.bytes !== 'number' ||
+      !Number.isFinite(parsed.bytes) ||
+      parsed.bytes <= 0 ||
+      !Array.isArray(parsed.headers)
+    ) {
+      return null;
+    }
+    const totalBytes =
+      typeof parsed.totalBytes === 'number' &&
+      Number.isFinite(parsed.totalBytes) &&
+      parsed.totalBytes > 0
+        ? parsed.totalBytes
+        : undefined;
+    return {
+      url: parsed.url,
+      bytes: Math.floor(parsed.bytes),
+      ...(totalBytes !== undefined ? { totalBytes } : {}),
+      ...(typeof parsed.etag === 'string' && parsed.etag ? { etag: parsed.etag } : {}),
+      headers: parsed.headers.filter(
+        (pair): pair is [string, string] =>
+          Array.isArray(pair) && typeof pair[0] === 'string' && typeof pair[1] === 'string'
+      ),
+      updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isDetachedArrayBuffer(buffer: ArrayBuffer | null | undefined): boolean {
+  if (!buffer || buffer.byteLength === 0) {
+    return true;
+  }
+  return Boolean((buffer as { detached?: boolean }).detached);
+}
+
+/**
+ * Consume a `ReadableStream<Uint8Array>` using a BYOB reader backed by a single reusable
+ * `ArrayBuffer` (falling back cleanly to default `getReader()` on non-byte streams) and yield
+ * periodically so mobile Workers reclaim external ArrayBuffers without GC sawtooth OOMs.
+ */
+export async function readStreamChunks(
+  stream: ReadableStream<Uint8Array>,
+  options: ReadStreamChunksOptions
+): Promise<void> {
+  const bufferBytes = Math.max(4096, Math.floor(options.stagingBytes ?? STREAM_READ_BUFFER_BYTES));
+  const yieldEveryBytes = Math.max(
+    bufferBytes,
+    Math.floor(options.yieldEveryBytes ?? DEFAULT_STREAM_YIELD_INTERVAL_BYTES)
+  );
+  const { signal, onChunk } = options;
+
+  let byobReader: ReadableStreamBYOBReader | null = null;
+  try {
+    byobReader = stream.getReader({ mode: 'byob' });
+  } catch {
+    byobReader = null;
+  }
+
+  let bytesSinceYield = 0;
+
+  if (byobReader) {
+    let staging = new ArrayBuffer(bufferBytes);
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        if (isDetachedArrayBuffer(staging)) {
+          staging = new ArrayBuffer(bufferBytes);
+        }
+        const view = new Uint8Array(staging);
+        let readResult: ReadableStreamReadResult<Uint8Array>;
+        try {
+          readResult = await byobReader.read(view);
+        } catch (readErr) {
+          throw markTransientStreamError(readErr);
+        }
+        const { done, value } = readResult;
+        if (done) {
+          break;
+        }
+        if (value && value.byteLength > 0) {
+          await onChunk(value);
+          bytesSinceYield += value.byteLength;
+          if (bytesSinceYield >= yieldEveryBytes) {
+            bytesSinceYield = 0;
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          }
+        }
+        const returnedBuf = value?.buffer as ArrayBuffer | undefined;
+        staging =
+          returnedBuf && !isDetachedArrayBuffer(returnedBuf) && returnedBuf.byteLength >= 4096
+            ? returnedBuf
+            : new ArrayBuffer(0);
+      }
+    } catch (err) {
+      await byobReader.cancel(err).catch(() => {});
+      throw err;
+    } finally {
+      staging = new ArrayBuffer(0);
+      try {
+        byobReader.releaseLock();
+      } catch {
+        // Ignore release errors after cancel
+      }
+    }
+    return;
+  }
+
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await reader.read();
+      } catch (readErr) {
+        throw markTransientStreamError(readErr);
+      }
+      const { done, value } = readResult;
+      if (done) {
+        break;
+      }
+      if (value && value.byteLength > 0) {
+        await onChunk(value);
+        bytesSinceYield += value.byteLength;
+        if (bytesSinceYield >= yieldEveryBytes) {
+          bytesSinceYield = 0;
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
+      }
+    }
+  } catch (err) {
+    await reader.cancel(err).catch(() => {});
+    throw err;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Ignore release errors after cancel
+    }
+  }
+}
+
+/**
+ * Check whether an incomplete persistent OPFS `.bin` + `.partial.json` exists and can be
+ * resumed via HTTP `Range: bytes=<byteOffset>-`. Cleans up corrupt/mismatched partials.
+ */
+export async function readOpfsResumableEntry(
+  opfsRoot: OpfsDirectoryLike | null | undefined,
+  url: string
+): Promise<OpfsResumableEntry | null> {
+  if (!isPersistentOpfsCapable(opfsRoot)) {
+    return null;
+  }
+  const dir = await getPersistentCacheDir(opfsRoot, false);
+  if (!dir) {
+    return null;
+  }
+
+  const stem = buildOpfsEntryStem(url);
+  const partialName = `${stem}${PARTIAL_SUFFIX}`;
+  const binName = `${stem}${BIN_SUFFIX}`;
+  const partialMeta = await readOpfsPartialMetaFile(dir, partialName);
+  if (!partialMeta || partialMeta.url !== url) {
+    return null;
+  }
+
+  try {
+    const fileHandle = await dir.getFileHandle(binName, { create: false });
+    const binFile = await fileHandle.getFile();
+    if (
+      binFile &&
+      binFile.size > 0 &&
+      binFile.size === partialMeta.bytes &&
+      (!partialMeta.totalBytes || binFile.size < partialMeta.totalBytes)
+    ) {
+      return {
+        byteOffset: binFile.size,
+        ...(partialMeta.totalBytes !== undefined ? { totalBytes: partialMeta.totalBytes } : {}),
+        ...(partialMeta.etag ? { etag: partialMeta.etag } : {}),
+      };
+    }
+  } catch {
+    // Missing or unreadable partial binary
+  }
+
+  await removeEntryQuietly(dir, partialName);
+  await removeEntryQuietly(dir, binName);
+  return null;
+}
+
+/**
+ * Remove any incomplete partial download metadata & binary for `url`.
+ */
+export async function clearOpfsResumableEntry(
+  opfsRoot: OpfsDirectoryLike | null | undefined,
+  url: string
+): Promise<void> {
+  if (!isPersistentOpfsCapable(opfsRoot)) {
+    return;
+  }
+  const dir = await getPersistentCacheDir(opfsRoot, false);
+  if (!dir) {
+    return;
+  }
+  const stem = buildOpfsEntryStem(url);
+  await removeEntryQuietly(dir, `${stem}${PARTIAL_SUFFIX}`);
+  await removeEntryQuietly(dir, `${stem}${BIN_SUFFIX}`);
 }
 
 export interface OpfsValidatedCachedFile {
@@ -460,6 +734,7 @@ export async function readOpfsCachedResponse(
 /**
  * Stream a ReadableStream directly into a persistent OPFS binary file with zero heap growth,
  * verifying exact byte count and committing metadata last so crashes never leave corrupt hits.
+ * Supports optional byte-offset resumption and `.partial.json` persistence on network failure.
  */
 export async function writeStreamToOpfsStore(options: {
   opfsRoot: OpfsDirectoryLike;
@@ -467,10 +742,24 @@ export async function writeStreamToOpfsStore(options: {
   stream: ReadableStream<Uint8Array>;
   headers: Headers;
   expectedTotalBytes?: number;
+  resumeFromBytes?: number;
+  keepPartialOnFailure?: boolean;
+  etag?: string;
   signal?: AbortSignal;
   onProgress?: (loadedBytes: number, totalBytes?: number) => void;
 }): Promise<number> {
-  const { opfsRoot, url, stream, headers, expectedTotalBytes, signal, onProgress } = options;
+  const {
+    opfsRoot,
+    url,
+    stream,
+    headers,
+    expectedTotalBytes,
+    resumeFromBytes = 0,
+    keepPartialOnFailure = false,
+    etag,
+    signal,
+    onProgress,
+  } = options;
   const dir = await getPersistentCacheDir(opfsRoot, true);
   if (!dir) {
     throw new Error('Persistent OPFS directory is unavailable.');
@@ -479,13 +768,17 @@ export async function writeStreamToOpfsStore(options: {
   const stem = buildOpfsEntryStem(url);
   const binName = `${stem}${BIN_SUFFIX}`;
   const metaName = `${stem}${META_SUFFIX}`;
+  const partialName = `${stem}${PARTIAL_SUFFIX}`;
   // Invalidate any stale meta before touching .bin so an interrupted download is never treated as complete.
   await removeEntryQuietly(dir, metaName);
 
+  const requestedResume =
+    Number.isFinite(resumeFromBytes) && resumeFromBytes > 0 ? Math.floor(resumeFromBytes) : 0;
+
   const fileHandle = await dir.getFileHandle(binName, { create: true });
-  const reader = stream.getReader();
   let accessHandle: OpfsSyncAccessHandleLike | null = null;
   let writable: OpfsWritableStreamLike | null = null;
+  let usedSyncAccess = false;
   let loadedBytes = 0;
 
   try {
@@ -495,7 +788,21 @@ export async function writeStreamToOpfsStore(options: {
         if (typeof accessHandle.write !== 'function') {
           throw new Error('OPFS SyncAccessHandle does not support write().');
         }
-        accessHandle.truncate?.(0);
+        usedSyncAccess = true;
+        if (requestedResume > 0) {
+          const existingSize =
+            typeof accessHandle.getSize === 'function'
+              ? accessHandle.getSize()
+              : (await fileHandle.getFile()).size;
+          if (existingSize !== requestedResume) {
+            throw new Error(
+              `OPFS resume offset mismatch for ${url}: disk=${existingSize}, requested=${requestedResume}.`
+            );
+          }
+          loadedBytes = requestedResume;
+        } else {
+          accessHandle.truncate?.(0);
+        }
       } catch (syncErr) {
         if (accessHandle) {
           try {
@@ -506,6 +813,7 @@ export async function writeStreamToOpfsStore(options: {
           accessHandle = null;
         }
         if (
+          requestedResume === 0 &&
           !isQuotaOrAbortOpfsError(syncErr) &&
           typeof fileHandle.createWritable === 'function'
         ) {
@@ -514,42 +822,36 @@ export async function writeStreamToOpfsStore(options: {
           throw syncErr;
         }
       }
-    } else if (typeof fileHandle.createWritable === 'function') {
+    } else if (requestedResume === 0 && typeof fileHandle.createWritable === 'function') {
       writable = await fileHandle.createWritable();
+    } else if (requestedResume > 0) {
+      throw new Error(`OPFS resume requires SyncAccessHandle for ${url}.`);
     } else {
       throw new Error('OPFS file handle does not support SyncAccessHandle or WritableStream.');
     }
 
-    while (true) {
-      if (signal?.aborted) {
-        throw new DOMException('Aborted', 'AbortError');
-      }
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      if (!value || value.byteLength === 0) {
-        continue;
-      }
-
-      if (accessHandle) {
-        let offset = 0;
-        while (offset < value.byteLength) {
-          const chunk = offset === 0 ? value : value.subarray(offset);
-          const written = accessHandle.write(chunk, { at: loadedBytes });
-          if (written <= 0) {
-            throw new Error(`OPFS write failed at offset ${loadedBytes} for ${url}`);
+    await readStreamChunks(stream, {
+      signal,
+      onChunk: async (value) => {
+        if (accessHandle) {
+          let offset = 0;
+          while (offset < value.byteLength) {
+            const chunk = offset === 0 ? value : value.subarray(offset);
+            const written = accessHandle.write(chunk, { at: loadedBytes });
+            if (written <= 0) {
+              throw new Error(`OPFS write failed at offset ${loadedBytes} for ${url}`);
+            }
+            loadedBytes += written;
+            offset += written;
           }
-          loadedBytes += written;
-          offset += written;
+        } else if (writable) {
+          await writable.write(value);
+          loadedBytes += value.byteLength;
         }
-      } else if (writable) {
-        await writable.write(value);
-        loadedBytes += value.byteLength;
-      }
 
-      onProgress?.(loadedBytes, expectedTotalBytes);
-    }
+        onProgress?.(loadedBytes, expectedTotalBytes);
+      },
+    });
 
     if (accessHandle) {
       accessHandle.flush();
@@ -570,13 +872,20 @@ export async function writeStreamToOpfsStore(options: {
       expectedTotalBytes > 0 &&
       finalBytes !== expectedTotalBytes
     ) {
-      throw new Error(
+      const sizeErr = new Error(
         `OPFS write size mismatch for ${url}: wrote ${finalBytes} bytes, expected ${expectedTotalBytes}.`
       );
+      if (keepPartialOnFailure && usedSyncAccess && finalBytes < expectedTotalBytes) {
+        // Premature clean EOF during network transfer can safely resume from finalBytes.
+        throw markTransientStreamError(sizeErr);
+      }
+      throw sizeErr;
     }
 
+    await removeEntryQuietly(dir, partialName);
     const finalHeaders = new Headers(headers);
     finalHeaders.delete('content-encoding');
+    finalHeaders.delete('content-range');
     finalHeaders.set('content-length', String(finalBytes));
     const meta: OpfsStoredEntryMeta = {
       url,
@@ -587,22 +896,79 @@ export async function writeStreamToOpfsStore(options: {
     await writeSmallTextFile(dir, metaName, JSON.stringify(meta));
     return finalBytes;
   } catch (err) {
-    try {
-      await reader.cancel(err);
-    } catch {
-      // Ignore cancel errors
-    }
-    if (accessHandle) {
+    const isAbort =
+      signal?.aborted || (err instanceof DOMException && err.name === 'AbortError');
+    const isTransient = isTransientStreamError(err);
+    const isIntegrityErr =
+      !isAbort &&
+      !isTransient &&
+      err instanceof Error &&
+      (err.message.includes('size mismatch') ||
+        err.message.includes('empty binary') ||
+        err.message.includes('OPFS resume'));
+
+    const isTruncationAfterClose =
+      keepPartialOnFailure &&
+      usedSyncAccess &&
+      isTransient &&
+      accessHandle === null &&
+      loadedBytes > 0;
+
+    if (
+      keepPartialOnFailure &&
+      (Boolean(accessHandle) || isTruncationAfterClose) &&
+      loadedBytes > 0 &&
+      !isAbort &&
+      !isQuotaOrAbortOpfsError(err) &&
+      !isIntegrityErr
+    ) {
       try {
-        accessHandle.close();
+        const pendingHandle = accessHandle as OpfsSyncAccessHandleLike | null;
+        if (pendingHandle) {
+          pendingHandle.flush();
+          pendingHandle.close();
+          accessHandle = null;
+        }
+        const diskFile = await fileHandle.getFile();
+        if (diskFile.size === loadedBytes) {
+          const partialHeaders = new Headers(headers);
+          partialHeaders.delete('content-encoding');
+          partialHeaders.delete('content-range');
+          const partialMeta: OpfsPartialEntryMeta = {
+            url,
+            bytes: loadedBytes,
+            ...(typeof expectedTotalBytes === 'number' && expectedTotalBytes > 0
+              ? { totalBytes: expectedTotalBytes }
+              : {}),
+            ...(etag ? { etag } : {}),
+            headers: [...partialHeaders.entries()],
+            updatedAt: Date.now(),
+          };
+          await writeSmallTextFile(dir, partialName, JSON.stringify(partialMeta));
+          throw err;
+        }
+      } catch (saveErr) {
+        if (saveErr === err) {
+          throw err;
+        }
+        // Fall through to full cleanup if saving partial state itself failed
+      }
+    }
+
+    const danglingHandle = accessHandle as OpfsSyncAccessHandleLike | null;
+    if (danglingHandle) {
+      try {
+        danglingHandle.close();
       } catch {
         // Ignore close errors
       }
+      accessHandle = null;
     }
     if (writable) {
       await writable.abort?.(err).catch(() => {});
     }
     await removeEntryQuietly(dir, metaName);
+    await removeEntryQuietly(dir, partialName);
     await removeEntryQuietly(dir, binName);
     throw err;
   }
@@ -763,6 +1129,7 @@ export async function clearOpfsModelEntries(
   }
 
   const entryNames = await listDirectoryEntryNames(dir);
+  const handledStems = new Set<string>();
   for (const name of entryNames) {
     if (!name.endsWith(META_SUFFIX)) {
       continue;
@@ -772,8 +1139,29 @@ export async function clearOpfsModelEntries(
       continue;
     }
     const stem = name.slice(0, -META_SUFFIX.length);
+    handledStems.add(stem);
     const binName = `${stem}${BIN_SUFFIX}`;
     clearedBytes += meta.byteLength;
+    deletedEntries += 1;
+    await removeEntryQuietly(dir, name);
+    await removeEntryQuietly(dir, `${stem}${PARTIAL_SUFFIX}`);
+    await removeEntryQuietly(dir, binName);
+  }
+
+  for (const name of entryNames) {
+    if (!name.endsWith(PARTIAL_SUFFIX)) {
+      continue;
+    }
+    const stem = name.slice(0, -PARTIAL_SUFFIX.length);
+    if (handledStems.has(stem)) {
+      continue;
+    }
+    const partial = await readOpfsPartialMetaFile(dir, name);
+    if (!partial || extractModelFileFromCacheUrl(partial.url, repoId) === null) {
+      continue;
+    }
+    const binName = `${stem}${BIN_SUFFIX}`;
+    clearedBytes += partial.bytes;
     deletedEntries += 1;
     await removeEntryQuietly(dir, name);
     await removeEntryQuietly(dir, binName);
