@@ -254,4 +254,58 @@ describe('webgpuUploadOptimizer', () => {
     staging.destroy();
     handle.dispose();
   });
+
+  it('captures synchronous writeBuffer, submit, and createBuffer errors via getLastError and onUploadError', () => {
+    const errors: unknown[] = [];
+    const mock = createMockGpuDevice({ failWrite: true });
+    const submitMock = vi.fn(() => {
+      throw new Error('submit failure: device is lost');
+    });
+    const origCreateBuffer = mock.device.createBuffer;
+    let throwOnNativeCreate = false;
+    mock.device.queue.submit = submitMock;
+    mock.device.createBuffer = (desc) => {
+      if (throwOnNativeCreate) {
+        throw new Error('native createBuffer OOM');
+      }
+      return origCreateBuffer.call(mock.device, desc);
+    };
+
+    const handle = installWebGpuUploadOptimizer(mock.device, {
+      onUploadError: (err) => errors.push(err),
+    });
+    expect(handle.getLastError()).toBeNull();
+    expect(handle.getStats().lastError).toBeUndefined();
+
+    // 1. writeBuffer error captured during virtual copyBufferToBuffer
+    const dst = mock.device.createBuffer({ size: 16, usage: 8, label: 'dst' });
+    const staging = mock.device.createBuffer({ mappedAtCreation: true, size: 16, usage: 6 }) as {
+      getMappedRange(): ArrayBuffer;
+      unmap(): void;
+      destroy(): void;
+    };
+    staging.getMappedRange();
+    staging.unmap();
+    const enc = mock.device.createCommandEncoder();
+    expect(() => enc.copyBufferToBuffer!(staging, 0, dst, 0, 16)).toThrow('writeBuffer failure');
+    expect((handle.getLastError() as Error).message).toBe('writeBuffer failure');
+    expect(handle.getStats().lastError).toContain('writeBuffer failure');
+    staging.destroy();
+
+    // 2. Native submit error captured
+    expect(() => mock.device.queue.submit!([{ kind: 'real-cmd' }])).toThrow(
+      'submit failure: device is lost'
+    );
+    expect((handle.getLastError() as Error).message).toContain('device is lost');
+
+    // 3. Native createBuffer error captured
+    throwOnNativeCreate = true;
+    expect(() => mock.device.createBuffer({ size: 64, usage: 8, label: 'weights' })).toThrow(
+      'native createBuffer OOM'
+    );
+    expect((handle.getLastError() as Error).message).toBe('native createBuffer OOM');
+    expect(errors).toHaveLength(3);
+
+    handle.dispose();
+  });
 });

@@ -30,11 +30,13 @@ export interface WebGpuUploadOptimizerStats {
   chunkWriteCount: number;
   bytesUploaded: number;
   peakScratchBytes: number;
+  lastError?: string;
 }
 
 export interface WebGpuUploadOptimizerHandle {
   dispose(): void;
   getStats(): WebGpuUploadOptimizerStats;
+  getLastError(): unknown;
 }
 
 export interface WebGpuUploadOptimizerOptions {
@@ -44,6 +46,8 @@ export interface WebGpuUploadOptimizerOptions {
   sharedScratchPool?: ExternalDataScratchPool | null;
   /** Threshold above which temporary upload scratch slabs are released right after copy. */
   maxRetainedScratchBytes?: number;
+  /** Optional hook invoked when a GPU upload operation throws synchronously. */
+  onUploadError?: (err: unknown) => void;
 }
 
 interface OptimizableCommandEncoder {
@@ -111,6 +115,9 @@ export function installWebGpuUploadOptimizer(
       getStats(): WebGpuUploadOptimizerStats {
         return { ...stats };
       },
+      getLastError(): unknown {
+        return null;
+      },
     };
   }
 
@@ -134,6 +141,14 @@ export function installWebGpuUploadOptimizer(
   let scratchView: Uint8Array | null = null;
   let activeStaging: ActiveVirtualStaging | null = null;
   let disposed = false;
+  let lastError: unknown = null;
+
+  const recordError = (err: unknown): unknown => {
+    lastError = err;
+    stats.lastError = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    options.onUploadError?.(err);
+    return err;
+  };
 
   const trimOversizedScratch = (byteLength: number): void => {
     if (byteLength <= maxRetainedScratchBytes) {
@@ -152,7 +167,11 @@ export function installWebGpuUploadOptimizer(
       commandBuffers: Iterable<unknown>
     ): void {
       if (disposed) {
-        origSubmit.call(this, commandBuffers);
+        try {
+          origSubmit.call(this, commandBuffers);
+        } catch (err) {
+          throw recordError(err);
+        }
         return;
       }
       const realCommandBuffers: unknown[] = [];
@@ -164,7 +183,11 @@ export function installWebGpuUploadOptimizer(
       if (realCommandBuffers.length === 0) {
         return;
       }
-      origSubmit.call(this, realCommandBuffers);
+      try {
+        origSubmit.call(this, realCommandBuffers);
+      } catch (err) {
+        throw recordError(err);
+      }
     };
   }
 
@@ -286,7 +309,11 @@ export function installWebGpuUploadOptimizer(
       return stagingState.token;
     }
 
-    return origCreateBuffer.call(this, descriptor);
+    try {
+      return origCreateBuffer.call(this, descriptor);
+    } catch (err) {
+      throw recordError(err);
+    }
   };
 
   target.createCommandEncoder = function patchedCreateCommandEncoder(
@@ -339,14 +366,18 @@ export function installWebGpuUploadOptimizer(
             (staging.mapped && scratchView ? scratchView : ensureScratch(staging.size));
           for (let off = 0; off < size; off += chunkBytes) {
             const len = Math.min(chunkBytes, size - off);
-            origWriteBuffer.call(
-              target.queue,
-              destination,
-              destinationOffset + off,
-              view,
-              sourceOffset + off,
-              len
-            );
+            try {
+              origWriteBuffer.call(
+                target.queue,
+                destination,
+                destinationOffset + off,
+                view,
+                sourceOffset + off,
+                len
+              );
+            } catch (err) {
+              throw recordError(err);
+            }
             stats.chunkWriteCount += 1;
             stats.bytesUploaded += len;
           }
@@ -410,6 +441,9 @@ export function installWebGpuUploadOptimizer(
     },
     getStats(): WebGpuUploadOptimizerStats {
       return { ...stats };
+    },
+    getLastError(): unknown {
+      return lastError;
     },
   };
 }

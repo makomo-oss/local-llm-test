@@ -1,10 +1,14 @@
+import { migrateCacheResponseToOpfs } from './modelPrecacher.ts';
 import {
   createBlobSyncReadHandle,
+  isPersistentOpfsCapable,
   openOpfsSyncReadHandle,
+  probeSyncReadHandle,
   readOpfsCachedResponse,
   type OpfsDirectoryLike,
   type OpfsSyncReadHandle,
 } from './opfsCacheStore.ts';
+import { createSyncHttpRangeReadHandle } from './syncHttpRangeReader.ts';
 
 /**
  * Reusable single-buffer scratch pool for synchronous ORT `externalData.subarray()`
@@ -81,6 +85,7 @@ export class ExternalDataScratchPool {
 
 export interface SyncAccessExternalDataProxyOptions {
   scratchPool?: ExternalDataScratchPool;
+  onReadError?: (info: { offset: number; length: number; error: unknown }) => void;
 }
 
 /**
@@ -99,6 +104,7 @@ export function createSyncAccessExternalDataProxy(
   const safeLength = Math.max(0, Math.floor(byteLength));
   const proxy = Object.create(Uint8Array.prototype) as Uint8Array;
   const scratchPool = options?.scratchPool;
+  const onReadError = options?.onReadError;
 
   Object.defineProperties(proxy, {
     BYTES_PER_ELEMENT: {
@@ -133,31 +139,36 @@ export function createSyncAccessExternalDataProxy(
           return new Uint8Array(0);
         }
 
-        const alignedSize = alignUp16(sliceLen);
-        const backing = scratchPool ? scratchPool.acquire(alignedSize) : new Uint8Array(sliceLen);
-        const out = backing.length === sliceLen ? backing : backing.subarray(0, sliceLen);
-        let filled = 0;
-        while (filled < sliceLen) {
-          const target = filled === 0 ? out : out.subarray(filled);
-          const bytesRead = readAt(target, start + filled);
-          if (!Number.isFinite(bytesRead) || bytesRead <= 0) {
-            throw new Error(
-              `Short synchronous OPFS external-data read at offset ${start + filled} (read ${bytesRead}, needed ${sliceLen - filled}).`
-            );
+        try {
+          const alignedSize = alignUp16(sliceLen);
+          const backing = scratchPool ? scratchPool.acquire(alignedSize) : new Uint8Array(sliceLen);
+          const out = backing.length === sliceLen ? backing : backing.subarray(0, sliceLen);
+          let filled = 0;
+          while (filled < sliceLen) {
+            const target = filled === 0 ? out : out.subarray(filled);
+            const bytesRead = readAt(target, start + filled);
+            if (!Number.isFinite(bytesRead) || bytesRead <= 0) {
+              throw new Error(
+                `Short synchronous external-data read at offset ${start + filled} (read ${bytesRead}, needed ${sliceLen - filled}).`
+              );
+            }
+            filled += bytesRead;
           }
-          filled += bytesRead;
+          const result = filled === sliceLen ? out : out.subarray(0, filled);
+          if (scratchPool && filled === sliceLen) {
+            if (alignedSize > sliceLen) {
+              // Zero only trailing 16-byte WebGPU alignment bytes without touching [0 .. sliceLen).
+              backing.fill(0, sliceLen, alignedSize);
+            }
+            if (backing.buffer instanceof ArrayBuffer) {
+              scratchPool.recordHandoff(backing.buffer, sliceLen, alignedSize);
+            }
+          }
+          return result;
+        } catch (err) {
+          onReadError?.({ offset: start, length: sliceLen, error: err });
+          throw err;
         }
-        const result = filled === sliceLen ? out : out.subarray(0, filled);
-        if (scratchPool && filled === sliceLen) {
-          if (alignedSize > sliceLen) {
-            // Zero only trailing 16-byte WebGPU alignment bytes without touching [0 .. sliceLen).
-            backing.fill(0, sliceLen, alignedSize);
-          }
-          if (backing.buffer instanceof ArrayBuffer) {
-            scratchPool.recordHandoff(backing.buffer, sliceLen, alignedSize);
-          }
-        }
-        return result;
       },
       enumerable: false,
       configurable: true,
@@ -293,6 +304,54 @@ export class ExternalDataSessionBridge {
     this.scratchPool.release();
   }
 
+  private lastReadError: {
+    url: string;
+    offset: number;
+    length: number;
+    error: unknown;
+  } | null = null;
+
+  consumeLastReadError(): {
+    url: string;
+    offset: number;
+    length: number;
+    error: unknown;
+  } | null {
+    const err = this.lastReadError;
+    this.lastReadError = null;
+    return err;
+  }
+
+  clearLastReadError(): void {
+    this.lastReadError = null;
+  }
+
+  private wrapVerifiedHandle(
+    handle: OpfsSyncReadHandle,
+    url: string,
+    sessionHandles: OpfsSyncReadHandle[]
+  ): Uint8Array {
+    try {
+      probeSyncReadHandle(handle, url);
+    } catch (err) {
+      try {
+        handle.close();
+      } catch {
+        // Ignore cleanup failure after failed readiness probe
+      }
+      throw err;
+    }
+
+    this.activeHandles.add(handle);
+    sessionHandles.push(handle);
+    return createSyncAccessExternalDataProxy(handle.byteLength, handle.readAt, {
+      scratchPool: this.scratchPool,
+      onReadError: ({ offset, length, error }) => {
+        this.lastReadError = { url, offset, length, error };
+      },
+    });
+  }
+
   private closeHandles(handles: OpfsSyncReadHandle[]): void {
     for (const handle of handles) {
       try {
@@ -312,19 +371,50 @@ export class ExternalDataSessionBridge {
     deps: ExternalDataResolveDeps,
     sessionHandles: OpfsSyncReadHandle[]
   ): Promise<Uint8Array> {
+    const MAX_IN_MEMORY_EXTERNAL_BYTES = 64 * 1024 * 1024;
+    let lastLocalReadError: unknown = null;
+    let knownByteLength: number | undefined;
+
     if (deps.opfsRoot) {
-      const syncHandle = await openOpfsSyncReadHandle(deps.opfsRoot, url);
-      if (syncHandle) {
-        this.activeHandles.add(syncHandle);
-        sessionHandles.push(syncHandle);
-        return createSyncAccessExternalDataProxy(syncHandle.byteLength, syncHandle.readAt, {
-          scratchPool: this.scratchPool,
-        });
+      let syncHandle = await openOpfsSyncReadHandle(deps.opfsRoot, url);
+      if (syncHandle?.source === 'blob-file-reader') {
+        try {
+          // Brief retry in case a preceding SyncAccessHandle close was still settling on mobile WebKit/Chrome.
+          knownByteLength = syncHandle.byteLength;
+          syncHandle.close();
+        } catch {
+          // Ignore close error before retry
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        syncHandle = await openOpfsSyncReadHandle(deps.opfsRoot, url);
       }
 
-      const opfsResp = await readOpfsCachedResponse(deps.opfsRoot, url);
-      if (opfsResp) {
-        return new Uint8Array(await opfsResp.arrayBuffer());
+      if (syncHandle) {
+        knownByteLength = syncHandle.byteLength;
+        try {
+          return this.wrapVerifiedHandle(syncHandle, url, sessionHandles);
+        } catch (err) {
+          lastLocalReadError = err;
+          this.lastReadError = {
+            url,
+            offset: 0,
+            length: Math.min(64, syncHandle.byteLength),
+            error: err,
+          };
+        }
+      }
+
+      if (!lastLocalReadError) {
+        const opfsResp = await readOpfsCachedResponse(deps.opfsRoot, url);
+        if (opfsResp) {
+          const contentLen = Number(opfsResp.headers.get('content-length') ?? '0');
+          if (Number.isFinite(contentLen) && contentLen > 0) {
+            knownByteLength = contentLen;
+          }
+          if (!Number.isFinite(contentLen) || contentLen <= MAX_IN_MEMORY_EXTERNAL_BYTES) {
+            return new Uint8Array(await opfsResp.arrayBuffer());
+          }
+        }
       }
     }
 
@@ -337,24 +427,95 @@ export class ExternalDataSessionBridge {
         const cache = await storage.open(deps.cacheName);
         const hit = await cache.match(url);
         if (hit) {
+          const headerLen = Number(hit.headers?.get?.('content-length') ?? '0');
+          if (Number.isFinite(headerLen) && headerLen > 0) {
+            knownByteLength = headerLen;
+          }
+
+          const cleanUrl = url.split('#')[0]?.split('?')[0] ?? url;
+          const isExternalBinary = /\.onnx_data(?:_\d+)?$/i.test(cleanUrl);
+          if (
+            isExternalBinary &&
+            isPersistentOpfsCapable(deps.opfsRoot) &&
+            typeof hit.clone === 'function'
+          ) {
+            const migrated = await migrateCacheResponseToOpfs({
+              opfsRoot: deps.opfsRoot,
+              url,
+              cachedResponse: hit.clone(),
+              cache: typeof (cache as { delete?: unknown }).delete === 'function' ? cache : undefined,
+            });
+            if (migrated) {
+              const migratedHandle = await openOpfsSyncReadHandle(deps.opfsRoot, url);
+              if (migratedHandle) {
+                knownByteLength = migratedHandle.byteLength;
+                try {
+                  return this.wrapVerifiedHandle(migratedHandle, url, sessionHandles);
+                } catch (err) {
+                  lastLocalReadError = err;
+                  this.lastReadError = {
+                    url,
+                    offset: 0,
+                    length: Math.min(64, migratedHandle.byteLength),
+                    error: err,
+                  };
+                }
+              }
+            }
+          }
+
           const hasWorkerFileReaderSync =
             typeof (globalThis as { FileReaderSync?: unknown }).FileReaderSync === 'function';
           if (hasWorkerFileReaderSync && typeof hit.blob === 'function') {
             const blob = await hit.blob();
+            if (blob.size > 0) {
+              knownByteLength = blob.size;
+            }
             const blobHandle = createBlobSyncReadHandle(blob, url);
             if (blobHandle) {
-              this.activeHandles.add(blobHandle);
-              sessionHandles.push(blobHandle);
-              return createSyncAccessExternalDataProxy(blobHandle.byteLength, blobHandle.readAt, {
-                scratchPool: this.scratchPool,
-              });
+              try {
+                return this.wrapVerifiedHandle(blobHandle, url, sessionHandles);
+              } catch (err) {
+                lastLocalReadError = err;
+                this.lastReadError = {
+                  url,
+                  offset: 0,
+                  length: Math.min(64, blob.size),
+                  error: err,
+                };
+              }
+            } else if (blob.size <= MAX_IN_MEMORY_EXTERNAL_BYTES) {
+              return new Uint8Array(await blob.arrayBuffer());
             }
-            return new Uint8Array(await blob.arrayBuffer());
+          } else if (
+            !lastLocalReadError &&
+            (!Number.isFinite(headerLen) || headerLen <= MAX_IN_MEMORY_EXTERNAL_BYTES)
+          ) {
+            return new Uint8Array(await hit.arrayBuffer());
           }
-          return new Uint8Array(await hit.arrayBuffer());
         }
-      } catch {
-        // Fall through to fetch fallback
+      } catch (err) {
+        if (!lastLocalReadError) {
+          lastLocalReadError = err;
+        }
+      }
+    }
+
+    // Last-resort fallback for mobile browsers where SyncAccessHandle is unavailable AND
+    // FileReaderSync throws NotReadableError on multi-hundred-MiB Blobs: stream via sync HTTP Range.
+    if (lastLocalReadError || (knownByteLength !== undefined && knownByteLength > MAX_IN_MEMORY_EXTERNAL_BYTES)) {
+      const rangeHandle = createSyncHttpRangeReadHandle(url, {
+        expectedByteLength: knownByteLength,
+      });
+      if (rangeHandle) {
+        try {
+          return this.wrapVerifiedHandle(rangeHandle, url, sessionHandles);
+        } catch (rangeErr) {
+          lastLocalReadError = rangeErr;
+        }
+      }
+      if (lastLocalReadError) {
+        throw lastLocalReadError;
       }
     }
 
@@ -365,6 +526,16 @@ export class ExternalDataSessionBridge {
     const resp = await fetchImpl(url);
     if (!resp.ok) {
       throw new Error(`Failed to fetch external ONNX data (${resp.status}) for ${url}`);
+    }
+    const respLen = Number(resp.headers?.get?.('content-length') ?? '0');
+    if (Number.isFinite(respLen) && respLen > MAX_IN_MEMORY_EXTERNAL_BYTES) {
+      await resp.body?.cancel?.().catch(() => {});
+      const rangeHandle = createSyncHttpRangeReadHandle(url, {
+        expectedByteLength: respLen,
+      });
+      if (rangeHandle) {
+        return this.wrapVerifiedHandle(rangeHandle, url, sessionHandles);
+      }
     }
     return new Uint8Array(await resp.arrayBuffer());
   }

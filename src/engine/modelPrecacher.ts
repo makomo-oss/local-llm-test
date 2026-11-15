@@ -802,6 +802,36 @@ async function streamResponseViaOpfsOrDirectCache(
 }
 
 /**
+ * Migrate a legacy/fallback `CacheStorage` entry into persistent OPFS via streaming
+ * (`writeResponseToOpfsStore`) and delete the redundant CacheStorage copy once OPFS
+ * verification succeeds. Leaves the original CacheStorage entry untouched if OPFS fails
+ * (e.g. `QuotaExceededError`), returning `false` cleanly so callers can fall back.
+ */
+export async function migrateCacheResponseToOpfs(options: {
+  opfsRoot: OpfsDirectoryLike | null | undefined;
+  url: string;
+  cachedResponse: Response;
+  cache?: Pick<Cache, 'delete'> | null;
+}): Promise<boolean> {
+  const { opfsRoot, url, cachedResponse, cache } = options;
+  if (!isPersistentOpfsCapable(opfsRoot)) {
+    return false;
+  }
+  try {
+    const written = await writeResponseToOpfsStore(opfsRoot, url, cachedResponse);
+    if (written <= 0) {
+      return false;
+    }
+    if (cache && typeof cache.delete === 'function') {
+      await cache.delete(url).catch(() => false);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Download every uncached ONNX model file sequentially one-at-a-time via
  * streaming `Cache.put()` (or OPFS disk spool -> `Response(File)` -> `Cache.put()`
  * on WebKit/Safari where stream-backed Cache.put is unsupported), preventing
@@ -883,6 +913,21 @@ export async function precacheModelFilesSequentially(
         loaded: 0,
         ...(cachedTotal !== undefined ? { total: cachedTotal, progress: 0 } : {}),
       });
+      if (
+        persistentOpfsReady &&
+        !existingOpfs &&
+        existingCache &&
+        filePath.includes('.onnx_data') &&
+        (existingCache.body != null || typeof existingCache.blob === 'function')
+      ) {
+        await migrateCacheResponseToOpfs({
+          opfsRoot,
+          url,
+          cachedResponse:
+            typeof existingCache.clone === 'function' ? existingCache.clone() : existingCache,
+          cache,
+        });
+      }
       options.onFileProgress?.({
         status: 'done',
         name: options.repoId,

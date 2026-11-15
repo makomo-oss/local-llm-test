@@ -500,6 +500,7 @@ export interface OpfsValidatedCachedFile {
 
 export interface OpfsSyncReadHandle {
   byteLength: number;
+  readonly source?: 'opfs-sync-access' | 'blob-file-reader' | 'remote-range';
   readAt(dest: Uint8Array, offset: number): number;
   close(): void;
 }
@@ -528,6 +529,59 @@ function isQuotaOrAbortOpfsError(err: unknown): boolean {
 }
 
 /**
+ * Verify with lightweight synchronous spot-reads (start, mid, tail <= 64 bytes each)
+ * that an `OpfsSyncReadHandle` can actually service random-access `readAt` calls
+ * before mounting it into ONNX Runtime (prevents mobile `NotReadableError` from
+ * being swallowed inside ORT's `catch { return 4 }` as "memory copy" errors).
+ */
+export function probeSyncReadHandle(
+  handle: Pick<OpfsSyncReadHandle, 'byteLength' | 'readAt' | 'source'>,
+  label = 'external-data'
+): void {
+  const totalSize = handle.byteLength;
+  if (!Number.isFinite(totalSize) || totalSize <= 0) {
+    return;
+  }
+  const offsets: number[] = [0];
+  const mid = Math.max(0, Math.floor(totalSize / 2) - 8);
+  const tail = Math.max(0, totalSize - 64);
+  if (!offsets.includes(mid)) {
+    offsets.push(mid);
+  }
+  if (!offsets.includes(tail)) {
+    offsets.push(tail);
+  }
+
+  for (const offset of offsets) {
+    const expectedLen = Math.min(64, totalSize - offset);
+    if (expectedLen <= 0) {
+      continue;
+    }
+    const probeBuf = new Uint8Array(expectedLen);
+    let readBytes = 0;
+    try {
+      readBytes = handle.readAt(probeBuf, offset);
+    } catch (err) {
+      const errName = err instanceof Error ? err.name : 'Error';
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const wrapped = new Error(
+        `Sync probe failed (${handle.source ?? 'unknown'}) for ${label} at ${offset}+${expectedLen}/${totalSize}: ${errName}: ${errMsg}`,
+        err instanceof Error ? { cause: err } : undefined
+      );
+      if (err instanceof Error && err.name) {
+        wrapped.name = err.name;
+      }
+      throw wrapped;
+    }
+    if (readBytes <= 0) {
+      throw new Error(
+        `Sync probe returned ${readBytes} bytes (${handle.source ?? 'unknown'}) for ${label} at ${offset}+${expectedLen}/${totalSize}`
+      );
+    }
+  }
+}
+
+/**
  * Create a synchronous `OpfsSyncReadHandle` backed by `FileReaderSync.readAsArrayBuffer(blob.slice(...))`
  * inside Dedicated Web Workers. Avoids buffering multi-GiB files in RAM when `createSyncAccessHandle`
  * is unavailable or throws (`NotSupportedError` / lock contention on Safari / WebViews).
@@ -553,11 +607,12 @@ export function createBlobSyncReadHandle(
     return undefined;
   }
 
-  const reader = new ReaderSyncCtor();
+  let reader: { readAsArrayBuffer(blob: Blob): ArrayBuffer } | null = null;
   let closed = false;
 
   return {
     byteLength: totalSize,
+    source: 'blob-file-reader',
     readAt(dest: Uint8Array, offset: number): number {
       if (closed) {
         throw new Error(`OPFS FileReaderSync handle is already closed for ${url}`);
@@ -570,7 +625,29 @@ export function createBlobSyncReadHandle(
       if (end <= safeOffset) {
         return 0;
       }
-      const ab = reader.readAsArrayBuffer(blob.slice(safeOffset, end));
+      const slice = blob.slice(safeOffset, end);
+      let ab: ArrayBuffer;
+      try {
+        reader ??= new ReaderSyncCtor();
+        ab = reader.readAsArrayBuffer(slice);
+      } catch (firstErr) {
+        try {
+          reader = new ReaderSyncCtor();
+          ab = reader.readAsArrayBuffer(blob.slice(safeOffset, end));
+        } catch (retryErr) {
+          const finalErr = retryErr ?? firstErr;
+          const errName = finalErr instanceof Error ? finalErr.name : 'Error';
+          const errMsg = finalErr instanceof Error ? finalErr.message : String(finalErr);
+          const wrapped = new Error(
+            `FileReaderSync failed reading ${url} [${safeOffset}..${end}/${totalSize}]: ${errName}: ${errMsg}`,
+            finalErr instanceof Error ? { cause: finalErr } : undefined
+          );
+          if (finalErr instanceof Error && finalErr.name) {
+            wrapped.name = finalErr.name;
+          }
+          throw wrapped;
+        }
+      }
       const chunk = new Uint8Array(ab);
       const copyLen = Math.min(dest.byteLength, chunk.byteLength);
       if (copyLen <= 0) {
@@ -581,6 +658,7 @@ export function createBlobSyncReadHandle(
     },
     close(): void {
       closed = true;
+      reader = null;
     },
   };
 }
@@ -659,6 +737,7 @@ export async function openOpfsSyncReadHandle(
         const readFn = accessHandle.read.bind(accessHandle);
         let closed = false;
         return {
+          source: 'opfs-sync-access',
           byteLength: totalSize,
           readAt(dest: Uint8Array, offset: number): number {
             if (closed) {
@@ -982,16 +1061,60 @@ export async function writeResponseToOpfsStore(
   url: string,
   response: Response
 ): Promise<number> {
+  const rawLen = Number(response.headers.get('content-length') ?? '0');
+  const expectedTotalBytes = Number.isFinite(rawLen) && rawLen > 0 ? rawLen : undefined;
+  const headers = new Headers(response.headers);
+
   if (response.body) {
-    const rawLen = Number(response.headers.get('content-length') ?? '0');
     return writeStreamToOpfsStore({
       opfsRoot,
       url,
       stream: response.body,
-      headers: new Headers(response.headers),
-      expectedTotalBytes: Number.isFinite(rawLen) && rawLen > 0 ? rawLen : undefined,
+      headers,
+      expectedTotalBytes,
     });
   }
+
+  if (typeof response.blob === 'function') {
+    const blob = await response.blob();
+    const blobTotal = blob.size > 0 ? blob.size : expectedTotalBytes;
+    if (typeof blob.stream === 'function') {
+      return writeStreamToOpfsStore({
+        opfsRoot,
+        url,
+        stream: blob.stream(),
+        headers,
+        expectedTotalBytes: blobTotal,
+      });
+    }
+    const SLICE_CHUNK_BYTES = 4 * 1024 * 1024;
+    let sliceOffset = 0;
+    const slicedStream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (sliceOffset >= blob.size) {
+          controller.close();
+          return;
+        }
+        const end = Math.min(blob.size, sliceOffset + SLICE_CHUNK_BYTES);
+        const ab = await blob.slice(sliceOffset, end).arrayBuffer();
+        sliceOffset = end;
+        if (ab.byteLength > 0) {
+          controller.enqueue(new Uint8Array(ab));
+        }
+        if (sliceOffset >= blob.size) {
+          controller.close();
+        }
+      },
+    });
+    return writeStreamToOpfsStore({
+      opfsRoot,
+      url,
+      stream: slicedStream,
+      headers,
+      expectedTotalBytes: blobTotal,
+    });
+  }
+
   const ab = await response.arrayBuffer();
   const singleChunkStream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -1005,7 +1128,7 @@ export async function writeResponseToOpfsStore(
     opfsRoot,
     url,
     stream: singleChunkStream,
-    headers: new Headers(response.headers),
+    headers,
     expectedTotalBytes: ab.byteLength,
   });
 }

@@ -68,7 +68,10 @@ import {
 import { ExternalDataSessionBridge } from './externalDataProxy.ts';
 import { resolveOpfsRootDirectory, type OpfsDirectoryLike } from './opfsCacheStore.ts';
 import { SessionLoadCoordinator, withSerializedInferenceSessions } from './sessionSerializer.ts';
-import { installWebGpuUploadOptimizer } from './webgpuUploadOptimizer.ts';
+import {
+  installWebGpuUploadOptimizer,
+  type WebGpuUploadOptimizerHandle,
+} from './webgpuUploadOptimizer.ts';
 
 const TRAILING_SPECIAL_DELIMITER_REGEX =
   /(?:(?:<turn\|>|<\|im_end\|>|<\|eot_id\|>|<\|end_of_text\|>|<end_of_turn>|<eos>|<\|endoftext\|>|<\/s>)\s*)+$/;
@@ -533,10 +536,80 @@ export function classifyModelLoadError(err: unknown): { code: string; message: s
     };
   }
 
+  if (
+    explicitCode === 'EXTERNAL_DATA_READ_FAILED' ||
+    explicitCode === 'SYNC_HTTP_RANGE_FAILED' ||
+    errName === 'NotReadableError' ||
+    /Unknown error occurred in memory copy|Deserialize tensor .*Failed to load external data file|Sync HTTP Range request failed|Unable to probe external data handle/i.test(
+      rawMessage
+    )
+  ) {
+    return {
+      code: 'EXTERNAL_DATA_READ_FAILED',
+      message: `モデルデータの読み込みまたはGPU転送に失敗しました (${rawMessage})。ブラウザのキャッシュ削除後の再読み込み、または CPU (WASM) / Qwen 3.5 0.8B などの軽量モデルへの切替をお試しください。`,
+    };
+  }
+
   return {
     code: 'MODEL_LOAD_FAILED',
     message: `モデルのロードに失敗しました: ${rawMessage}`,
   };
+}
+
+/**
+ * Attach captured external-data read or WebGPU staging upload exceptions that ORT's
+ * Emscripten memory-copy shim (`catch { return 4 }`) would otherwise swallow.
+ */
+export function enrichModelLoadError(
+  err: unknown,
+  readFailure?: { url: string; offset: number; length: number; error: unknown } | null,
+  uploadFailure?: unknown
+): unknown {
+  if (!readFailure && !uploadFailure) {
+    return err;
+  }
+
+  const rawMessage = formatWorkerError(err);
+  const details: string[] = [];
+  if (readFailure) {
+    const fileLabel = readFailure.url.split('/').pop() || readFailure.url;
+    const readErrName =
+      readFailure.error instanceof Error && readFailure.error.name
+        ? `${readFailure.error.name}: `
+        : '';
+    const readMsg = formatWorkerError(readFailure.error);
+    const readText = readErrName && !readMsg.startsWith(readErrName) ? `${readErrName}${readMsg}` : readMsg;
+    details.push(
+      `[external-read ${fileLabel} @ ${readFailure.offset}+${readFailure.length}] ${readText}`
+    );
+  }
+  if (uploadFailure) {
+    const uploadErrName =
+      uploadFailure instanceof Error && uploadFailure.name ? `${uploadFailure.name}: ` : '';
+    const uploadMsg = formatWorkerError(uploadFailure);
+    const uploadText =
+      uploadErrName && !uploadMsg.startsWith(uploadErrName)
+        ? `${uploadErrName}${uploadMsg}`
+        : uploadMsg;
+    details.push(`[webgpu-upload] ${uploadText}`);
+  }
+
+  const enriched = new Error(`${rawMessage} — 原因: ${details.join(' / ')}`) as Error & {
+    code?: string;
+    cause?: unknown;
+  };
+  enriched.cause = err;
+  const readCode =
+    readFailure?.error && typeof readFailure.error === 'object'
+      ? (readFailure.error as { code?: unknown }).code
+      : undefined;
+  const readName = readFailure?.error instanceof Error ? readFailure.error.name : '';
+  if (typeof readCode === 'string' && readCode) {
+    enriched.code = readCode;
+  } else if (readName === 'NotReadableError') {
+    enriched.name = 'NotReadableError';
+  }
+  return enriched;
 }
 
 const MIN_PREFLIGHT_CHECK_BYTES = 64 * 1024 * 1024;
@@ -901,6 +974,7 @@ async function handleLoadModel(
   const loadStartMs = performance.now();
   let acquiredGpu: AcquiredGpuDevice | null = null;
   let loadedModel: PreTrainedModel | null = null;
+  let webGpuOptimizer: WebGpuUploadOptimizerHandle | null = null;
   const sessionCoordinator = new SessionLoadCoordinator();
   const loadAbortController = new AbortController();
   const externalDataBridge = new ExternalDataSessionBridge();
@@ -1152,7 +1226,8 @@ async function handleLoadModel(
 
     const cacheName = env.cacheKey || TRANSFORMERS_CACHE_NAME;
     const useOnDemandEmbed = resolved.onDemandEmbedTokens !== false;
-    const webGpuOptimizer =
+    externalDataBridge.clearLastReadError();
+    webGpuOptimizer =
       deviceOption.backend === 'webgpu' && acquiredGpu
         ? installWebGpuUploadOptimizer(acquiredGpu.device, {
             sharedScratchPool: externalDataBridge.getScratchPool(),
@@ -1301,7 +1376,11 @@ async function handleLoadModel(
     }
     await disposeLoadedRuntime();
 
-    const classified = classifyModelLoadError(err);
+    const capturedReadError = externalDataBridge.consumeLastReadError();
+    const capturedUploadError = webGpuOptimizer?.getLastError() ?? null;
+    const classified = classifyModelLoadError(
+      enrichModelLoadError(err, capturedReadError, capturedUploadError)
+    );
     postWorkerMessage({
       type: 'error',
       requestId: req.requestId,

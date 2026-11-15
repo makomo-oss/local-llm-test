@@ -18,22 +18,31 @@ import {
   assertStorageQuotaForDownload,
   assertWebGpuSingleTensorLimit,
   classifyModelLoadError,
+  enrichModelLoadError,
   resolveQuotaAwareEmbedPlan,
 } from '../src/engine/llm.worker.ts';
-import { createSerializedCacheAdapter } from '../src/engine/modelPrecacher.ts';
 import {
+  createSerializedCacheAdapter,
+  migrateCacheResponseToOpfs,
+  precacheModelFilesSequentially,
+} from '../src/engine/modelPrecacher.ts';
+import {
+  createBlobSyncReadHandle,
   openOpfsSyncReadHandle,
+  probeSyncReadHandle,
   writeResponseToOpfsStore,
   writeStreamToOpfsStore,
   type OpfsDirectoryLike,
   type OpfsFileHandleLike,
   type OpfsSyncAccessHandleLike,
+  type OpfsSyncReadHandle,
   type OpfsWritableStreamLike,
 } from '../src/engine/opfsCacheStore.ts';
 import {
   SessionLoadCoordinator,
   withSerializedInferenceSessions,
 } from '../src/engine/sessionSerializer.ts';
+import { createSyncHttpRangeReadHandle } from '../src/engine/syncHttpRangeReader.ts';
 import { installWebGpuUploadOptimizer } from '../src/engine/webgpuUploadOptimizer.ts';
 import { getModelById, resolveEffectiveDtype } from '../src/models/catalog.ts';
 import { assessModelMemoryRisk } from '../src/telemetry/systemProbe.ts';
@@ -291,6 +300,10 @@ function createMockCacheStorage(initialEntries: Record<string, Uint8Array> = {})
     async put(req: RequestInfo | URL, resp: Response): Promise<void> {
       const key = typeof req === 'string' ? req : req instanceof URL ? req.href : req.url;
       store.set(key, new Uint8Array(await resp.arrayBuffer()));
+    },
+    async delete(req: RequestInfo | URL): Promise<boolean> {
+      const key = typeof req === 'string' ? req : req instanceof URL ? req.href : req.url;
+      return store.delete(key);
     },
   };
   return {
@@ -620,7 +633,7 @@ describe('externalDataProxy, sessionSerializer hooks & modelPrecacher virtualiza
     expect(proxy.subarray(50, 50)).toEqual(new Uint8Array(0));
 
     const brokenProxy = createSyncAccessExternalDataProxy(16, () => 0);
-    expect(() => brokenProxy.subarray(0, 8)).toThrow(/Short synchronous OPFS/);
+    expect(() => brokenProxy.subarray(0, 8)).toThrow(/Short synchronous (?:OPFS|external-data) read/);
   });
 
   it('ExternalDataSessionBridge opens SyncAccessHandle proxies and closes handles cleanly on success and failure', async () => {
@@ -1501,5 +1514,602 @@ describe('WebGPU single-tensor limits, streaming risk & WEBGPU_BUFFER_LIMIT erro
         cacheInfos: [],
       })
     ).toThrow(expect.objectContaining({ code: 'STORAGE_QUOTA_EXCEEDED' }));
+  });
+});
+
+describe('Sync external-data reliability, Cache->OPFS migration & Range fallback', () => {
+  it('probeSyncReadHandle validates 0-byte, 1-byte, multi-chunk handles and throws preserving NotReadableError or 0-byte EOF', () => {
+    const emptyHandle: OpfsSyncReadHandle = {
+      byteLength: 0,
+      readAt: () => 0,
+      close: vi.fn(),
+    };
+    expect(() => probeSyncReadHandle(emptyHandle, 'empty.onnx_data')).not.toThrow();
+
+    const tinyBytes = new Uint8Array([42]);
+    const tinyOffsets: number[] = [];
+    const tinyHandle: OpfsSyncReadHandle = {
+      byteLength: 1,
+      readAt: (dest, offset) => {
+        tinyOffsets.push(offset);
+        dest.set(tinyBytes.subarray(offset, offset + dest.byteLength), 0);
+        return dest.byteLength;
+      },
+      close: vi.fn(),
+    };
+    probeSyncReadHandle(tinyHandle, 'tiny.onnx_data');
+    expect(tinyOffsets).toEqual([0]);
+
+    const midOffsets: number[] = [];
+    const largeHandle: OpfsSyncReadHandle = {
+      byteLength: 4096,
+      readAt: (dest, offset) => {
+        midOffsets.push(offset);
+        return dest.byteLength;
+      },
+      close: vi.fn(),
+    };
+    probeSyncReadHandle(largeHandle, 'large.onnx_data');
+    expect(midOffsets).toEqual([0, 2040, 4032]);
+
+    const tailFailingHandle: OpfsSyncReadHandle = {
+      byteLength: 4096,
+      readAt: (dest, offset) => {
+        if (offset >= 4000) {
+          throw new DOMException('Tail slice unreadable', 'NotReadableError');
+        }
+        return dest.byteLength;
+      },
+      close: vi.fn(),
+    };
+    expect(() => probeSyncReadHandle(tailFailingHandle, 'broken.onnx_data')).toThrow(
+      expect.objectContaining({ name: 'NotReadableError' })
+    );
+
+    const eofHandle: OpfsSyncReadHandle = {
+      byteLength: 1024,
+      readAt: () => 0,
+      close: vi.fn(),
+    };
+    expect(() => probeSyncReadHandle(eofHandle, 'eof.onnx_data')).toThrow(
+      /Sync probe returned 0 bytes/
+    );
+  });
+
+  it('tags OPFS sync vs blob sources, retries FileReaderSync once, and wraps permanent NotReadableError', async () => {
+    const { root } = createMockOpfsRoot();
+    const url = 'https://example.com/model/decoder.onnx_data';
+    const data = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    await writeResponseToOpfsStore(root, url, new Response(data));
+
+    const opfsHandle = await openOpfsSyncReadHandle(root, url);
+    expect(opfsHandle?.source).toBe('opfs-sync-access');
+    opfsHandle?.close();
+
+    // Without createSyncAccessHandle at any OPFS directory depth, openOpfsSyncReadHandle falls back to blob-file-reader
+    const wrapDirWithoutSync = (dir: OpfsDirectoryLike): OpfsDirectoryLike => ({
+      async getDirectoryHandle(name, opts) {
+        return wrapDirWithoutSync(await dir.getDirectoryHandle!(name, opts));
+      },
+      async getFileHandle(fileName, fileOpts) {
+        const fh = await dir.getFileHandle!(fileName, fileOpts);
+        return {
+          getFile: fh.getFile,
+          createWritable: fh.createWritable,
+        };
+      },
+      async removeEntry(name, opts) {
+        return dir.removeEntry(name, opts);
+      },
+    });
+    const blobOnlyRoot = wrapDirWithoutSync(root);
+
+    const g = globalThis as { FileReaderSync?: unknown };
+    const origFrs = g.FileReaderSync;
+    let transientCalls = 0;
+    class RetryingMockFileReaderSync {
+      readAsArrayBuffer(blobSlice: Blob): ArrayBuffer {
+        transientCalls += 1;
+        if (transientCalls === 1) {
+          throw new DOMException('Transient read lock', 'NotReadableError');
+        }
+        return data.subarray(0, blobSlice.size).slice().buffer;
+      }
+    }
+    try {
+      g.FileReaderSync = RetryingMockFileReaderSync;
+      const fallbackHandle = await openOpfsSyncReadHandle(blobOnlyRoot, url);
+      expect(fallbackHandle?.source).toBe('blob-file-reader');
+      const dst = new Uint8Array(4);
+      expect(fallbackHandle!.readAt(dst, 0)).toBe(4);
+      expect(transientCalls).toBe(2);
+      expect(dst).toEqual(new Uint8Array([1, 2, 3, 4]));
+      fallbackHandle?.close();
+
+      class AlwaysFailingFileReaderSync {
+        readAsArrayBuffer(): ArrayBuffer {
+          throw new DOMException('The requested file could not be read', 'NotReadableError');
+        }
+      }
+      g.FileReaderSync = AlwaysFailingFileReaderSync;
+      const brokenBlobHandle = createBlobSyncReadHandle(new Blob([data]), url, data.byteLength);
+      expect(() => brokenBlobHandle!.readAt(new Uint8Array(4), 0)).toThrow(
+        expect.objectContaining({
+          name: 'NotReadableError',
+        })
+      );
+      expect(() => brokenBlobHandle!.readAt(new Uint8Array(4), 0)).toThrow(
+        /FileReaderSync failed reading .* \[0\.\.4\/8\]: NotReadableError/
+      );
+    } finally {
+      g.FileReaderSync = origFrs;
+    }
+  });
+
+  it('writeResponseToOpfsStore streams null-body CacheStorage responses via blob.stream() or sliced blob without arrayBuffer()', async () => {
+    const payload = new Uint8Array(1024 * 1024 + 321);
+    for (let i = 0; i < payload.length; i += 1) {
+      payload[i] = (i * 13) & 0xff;
+    }
+
+    // 1. Response with body === null and blob.stream() present
+    const { root: root1 } = createMockOpfsRoot();
+    const arrayBufferSpy1 = vi.fn(async () => {
+      throw new Error('Must not call arrayBuffer()');
+    });
+    const fakeBlob1 = new Blob([payload]);
+    const respViaBlobStream = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-length': String(payload.byteLength) }),
+      body: null,
+      blob: async () => fakeBlob1,
+      arrayBuffer: arrayBufferSpy1,
+    } as unknown as Response;
+
+    const url1 = 'https://example.com/m/stream_from_blob.onnx_data';
+    const written1 = await writeResponseToOpfsStore(root1, url1, respViaBlobStream);
+    expect(written1).toBe(payload.byteLength);
+    expect(arrayBufferSpy1).not.toHaveBeenCalled();
+
+    const handle1 = await openOpfsSyncReadHandle(root1, url1);
+    const out1 = new Uint8Array(payload.byteLength);
+    expect(handle1!.readAt(out1, 0)).toBe(payload.byteLength);
+    expect(out1).toEqual(payload);
+    handle1?.close();
+
+    // 2. Response with body === null AND no blob.stream() -> falls back to sliced blob chunks
+    const { root: root2 } = createMockOpfsRoot();
+    const sliceCalls: Array<[number, number]> = [];
+    const blobWithoutStream = {
+      size: payload.byteLength,
+      slice(start?: number, end?: number) {
+        const s = start ?? 0;
+        const e = end ?? payload.byteLength;
+        sliceCalls.push([s, e]);
+        return {
+          async arrayBuffer() {
+            return payload.subarray(s, e).slice().buffer;
+          },
+        };
+      },
+    } as unknown as Blob;
+    const respViaSlicedBlob = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-length': String(payload.byteLength) }),
+      body: null,
+      blob: async () => blobWithoutStream,
+      arrayBuffer: vi.fn(async () => {
+        throw new Error('Must not call full arrayBuffer()');
+      }),
+    } as unknown as Response;
+
+    const url2 = 'https://example.com/m/sliced_blob.onnx_data';
+    const written2 = await writeResponseToOpfsStore(root2, url2, respViaSlicedBlob);
+    expect(written2).toBe(payload.byteLength);
+    expect(sliceCalls).toEqual([[0, payload.byteLength]]);
+
+    const handle2 = await openOpfsSyncReadHandle(root2, url2);
+    const out2 = new Uint8Array(payload.byteLength);
+    expect(handle2!.readAt(out2, 0)).toBe(payload.byteLength);
+    expect(out2).toEqual(payload);
+    handle2?.close();
+  });
+
+  it('migrateCacheResponseToOpfs and precacheModelFilesSequentially migrate CacheStorage .onnx_data and preserve cache on QuotaExceededError', async () => {
+    const url =
+      'https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/onnx/decoder_model_merged_q4f16.onnx_data';
+    const bytes = new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2]);
+
+    const cacheStorage = createMockCacheStorage({ [url]: bytes });
+    const cache = await cacheStorage.open('transformers-cache');
+    const { root } = createMockOpfsRoot();
+
+    // QuotaExceededError during OPFS write must return false and preserve CacheStorage entry
+    const quotaRoot: OpfsDirectoryLike = {
+      async getDirectoryHandle() {
+        throw new DOMException('OPFS quota exceeded', 'QuotaExceededError');
+      },
+      async getFileHandle() {
+        throw new DOMException('OPFS quota exceeded', 'QuotaExceededError');
+      },
+      async removeEntry() {},
+    };
+    const quotaOk = await migrateCacheResponseToOpfs({
+      opfsRoot: quotaRoot,
+      url,
+      cachedResponse: (await cache.match(url))!,
+      cache,
+    });
+    expect(quotaOk).toBe(false);
+    expect(await cache.match(url)).toBeDefined();
+
+    // precacheModelFilesSequentially migrates legacy CacheStorage hit -> OPFS without fetching
+    const fetchSpy = vi.fn(async () => {
+      throw new Error('Should not fetch cached file');
+    }) as unknown as typeof fetch;
+    const precacheRes = await precacheModelFilesSequentially({
+      repoId: 'onnx-community/gemma-4-E2B-it-ONNX',
+      files: ['onnx/decoder_model_merged_q4f16.onnx_data'],
+      cacheStorage,
+      opfsRoot: root,
+      fetchFn: fetchSpy,
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(precacheRes.skippedCachedFiles).toBe(1);
+    expect(await cache.match(url)).toBeUndefined();
+
+    const opfsHandle = await openOpfsSyncReadHandle(root, url);
+    expect(opfsHandle?.source).toBe('opfs-sync-access');
+    const verified = new Uint8Array(bytes.byteLength);
+    expect(opfsHandle!.readAt(verified, 0)).toBe(bytes.byteLength);
+    expect(verified).toEqual(bytes);
+    opfsHandle?.close();
+  });
+
+  it('createSyncHttpRangeReadHandle discovers length via HEAD or bytes=0-0, stitches multi-chunk reads, retries 503, and rejects OOB/404/short responses', () => {
+    const backing = new Uint8Array(25);
+    for (let i = 0; i < backing.length; i += 1) {
+      backing[i] = i + 10;
+    }
+
+    const requests: Array<{ method: string; range: string | null }> = [];
+    let forceTransient503Once = true;
+    const makeXhr = (omitHeadLength: boolean, force200OnGet = false) => () => {
+      let method = 'GET';
+      let rangeHeader: string | null = null;
+      const xhr = {
+        status: 0,
+        responseType: '' as XMLHttpRequestResponseType,
+        response: null as unknown,
+        open(m: string) {
+          method = m;
+        },
+        setRequestHeader(name: string, value: string) {
+          if (name.toLowerCase() === 'range') {
+            rangeHeader = value;
+          }
+        },
+        getResponseHeader(name: string) {
+          const lower = name.toLowerCase();
+          if (method === 'HEAD' && lower === 'content-length') {
+            return omitHeadLength ? null : String(backing.byteLength);
+          }
+          if (lower === 'content-range' && rangeHeader === 'bytes=0-0') {
+            return `bytes 0-0/${backing.byteLength}`;
+          }
+          return null;
+        },
+        send() {
+          requests.push({ method, range: rangeHeader });
+          if (method === 'HEAD') {
+            xhr.status = 200;
+            return;
+          }
+          if (rangeHeader === 'bytes=0-0') {
+            xhr.status = 206;
+            xhr.response = backing.subarray(0, 1).slice().buffer;
+            return;
+          }
+          if (forceTransient503Once && rangeHeader === 'bytes=8-13') {
+            forceTransient503Once = false;
+            xhr.status = 503;
+            return;
+          }
+          if (force200OnGet) {
+            xhr.status = 200;
+            xhr.response = backing.slice().buffer;
+            return;
+          }
+          const match = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader ?? '');
+          if (!match) {
+            xhr.status = 400;
+            return;
+          }
+          const start = Number(match[1]);
+          const end = Math.min(backing.byteLength - 1, Number(match[2]));
+          xhr.status = 206;
+          xhr.response = backing.subarray(start, end + 1).slice().buffer;
+        },
+      };
+      return xhr;
+    };
+
+    // HEAD missing Content-Length -> falls back to Range: bytes=0-0 Content-Range probe
+    const handle = createSyncHttpRangeReadHandle('https://example.com/weights.onnx_data', {
+      maxChunkBytes: 6,
+      xhrFactory: makeXhr(true, false),
+    });
+    expect(handle?.source).toBe('remote-range');
+    expect(handle?.byteLength).toBe(25);
+
+    // Multi-chunk read across 3 HTTP Range requests + transient 503 retry
+    const dest = new Uint8Array(15);
+    expect(handle!.readAt(dest, 2)).toBe(15);
+    expect(dest).toEqual(backing.subarray(2, 17));
+    expect(requests.filter((r) => r.range === 'bytes=8-13')).toHaveLength(2);
+
+    // Boundary: out-of-range offset throws, 0-length succeeds, closed handle throws
+    expect(() => handle!.readAt(new Uint8Array(1), -1)).toThrow(/Out-of-range/);
+    expect(() => handle!.readAt(new Uint8Array(1), 26)).toThrow(/Out-of-range/);
+    expect(handle!.readAt(new Uint8Array(0), 25)).toBe(0);
+    handle!.close();
+    expect(() => handle!.readAt(new Uint8Array(4), 0)).toThrow(/already closed/);
+
+    // HTTP 200 full-response slicing still yields requested window
+    const h200 = createSyncHttpRangeReadHandle('https://example.com/full200.onnx_data', {
+      expectedByteLength: 25,
+      xhrFactory: makeXhr(false, true),
+    });
+    const out200 = new Uint8Array(5);
+    expect(h200!.readAt(out200, 10)).toBe(5);
+    expect(out200).toEqual(backing.subarray(10, 15));
+    h200!.close();
+
+    // Permanent 404 or short 206 throws SYNC_HTTP_RANGE_FAILED
+    const failing404 = createSyncHttpRangeReadHandle('https://example.com/missing.onnx_data', {
+      expectedByteLength: 10,
+      xhrFactory: () => {
+        const x = {
+          status: 404,
+          responseType: '' as XMLHttpRequestResponseType,
+          response: null,
+          open: vi.fn(),
+          setRequestHeader: vi.fn(),
+          getResponseHeader: () => null,
+          send: vi.fn(),
+        };
+        return x;
+      },
+    });
+    expect(() => failing404!.readAt(new Uint8Array(4), 0)).toThrow(
+      expect.objectContaining({ code: 'SYNC_HTTP_RANGE_FAILED' })
+    );
+  });
+
+  it('ExternalDataSessionBridge migrates CacheStorage -> OPFS, retries transient lock, falls back to Range on NotReadableError without 1.4GB RAM copy, and retains errors across closeAll()', async () => {
+    const decoderUrl =
+      'https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/onnx/decoder_model_merged_q4f16.onnx_data';
+    const payload = new Uint8Array([11, 22, 33, 44, 55, 66, 77, 88, 99, 100]);
+
+    // Case 1: CacheStorage hit migrates into OPFS SyncAccessHandle so FileReaderSync is never touched
+    const { root } = createMockOpfsRoot();
+    const cacheStorage = createMockCacheStorage({ [decoderUrl]: payload });
+    const bridge1 = new ExternalDataSessionBridge();
+    bridge1.registerUrl('decoder_model_merged_q4f16.onnx_data', decoderUrl);
+
+    const g = globalThis as { FileReaderSync?: unknown; caches?: unknown; XMLHttpRequest?: unknown };
+    const origFrs = g.FileReaderSync;
+    const origCaches = g.caches;
+    const origXhr = g.XMLHttpRequest;
+    const frsCtorSpy = vi.fn();
+    g.FileReaderSync = class FailIfUsedFileReaderSync {
+      constructor() {
+        frsCtorSpy();
+      }
+      readAsArrayBuffer(): ArrayBuffer {
+        throw new Error('Should have migrated to OPFS SyncAccessHandle');
+      }
+    };
+    g.caches = cacheStorage;
+
+    try {
+      const sessionOpts1: { externalData: Array<string | { path: string; data: Uint8Array }> } = {
+        externalData: ['decoder_model_merged_q4f16.onnx_data'],
+      };
+      const release1 = await bridge1.prepareSessionExternalData(sessionOpts1, {
+        opfsRoot: root,
+        cacheName: 'transformers-cache',
+      });
+      const entryData = (sessionOpts1.externalData[0] as { path: string; data: Uint8Array }).data;
+      expect(entryData.subarray(2, 6)).toEqual(payload.subarray(2, 6));
+      expect(frsCtorSpy).not.toHaveBeenCalled();
+      const cacheAfter = await cacheStorage.open('transformers-cache');
+      expect(await cacheAfter.match(decoderUrl)).toBeUndefined();
+      release1();
+      bridge1.closeAll();
+
+      // Case 1b: Transient SyncAccessHandle contention ('blob-file-reader' first -> 'opfs-sync-access' on 20ms retry)
+      let binHandleRequests = 0;
+      const wrapTransientSyncLock = (dir: OpfsDirectoryLike): OpfsDirectoryLike => ({
+        async getDirectoryHandle(name, opts) {
+          return wrapTransientSyncLock(await dir.getDirectoryHandle!(name, opts));
+        },
+        async getFileHandle(fileName, fileOpts) {
+          const fh = await dir.getFileHandle!(fileName, fileOpts);
+          if (!fileName.endsWith('.bin') || fileOpts?.create) {
+            return fh;
+          }
+          binHandleRequests += 1;
+          const failSyncOnce = binHandleRequests === 1;
+          return {
+            getFile: fh.getFile,
+            createWritable: fh.createWritable,
+            async createSyncAccessHandle() {
+              if (failSyncOnce) {
+                throw new DOMException('NoModificationAllowedError lock held briefly', 'NoModificationAllowedError');
+              }
+              return fh.createSyncAccessHandle!();
+            },
+          };
+        },
+        async removeEntry(name, opts) {
+          return dir.removeEntry(name, opts);
+        },
+      });
+      const retryBridge = new ExternalDataSessionBridge();
+      retryBridge.registerUrl('decoder_model_merged_q4f16.onnx_data', decoderUrl);
+      const retryOpts: { externalData: Array<string | { path: string; data: Uint8Array }> } = {
+        externalData: ['decoder_model_merged_q4f16.onnx_data'],
+      };
+      await retryBridge.prepareSessionExternalData(retryOpts, {
+        opfsRoot: wrapTransientSyncLock(root),
+        cacheName: 'transformers-cache',
+      });
+      expect(binHandleRequests).toBe(2);
+      expect(
+        (retryOpts.externalData[0] as { path: string; data: Uint8Array }).data.subarray(0, 4)
+      ).toEqual(payload.subarray(0, 4));
+      expect(frsCtorSpy).not.toHaveBeenCalled();
+      retryBridge.closeAll();
+
+      // Case 2: CacheStorage-only FileReaderSync fails NotReadableError -> falls back cleanly to sync Range without arrayBuffer() OOM
+      const bigBytesHeaderOnly = new Headers({
+        'content-length': String(128 * 1024 * 1024),
+      });
+      const arrayBufferOomTrap = vi.fn(async () => {
+        throw new Error('arrayBuffer() must NEVER be called on >64MiB external data');
+      });
+      const fakeBigCache: Cache = {
+        match: vi.fn(async () => ({
+          ok: true,
+          status: 200,
+          headers: bigBytesHeaderOnly,
+          blob: async () => ({ size: 128 * 1024 * 1024, slice: () => new Blob([new Uint8Array(64)]) }),
+          arrayBuffer: arrayBufferOomTrap,
+          clone() {
+            return this;
+          },
+        })) as unknown as Cache['match'],
+        delete: vi.fn(async () => true),
+      } as unknown as Cache;
+      g.caches = { open: vi.fn(async () => fakeBigCache) };
+      g.FileReaderSync = class NotReadableFrs {
+        readAsArrayBuffer(): ArrayBuffer {
+          throw new DOMException('The requested file could not be read', 'NotReadableError');
+        }
+      };
+      g.XMLHttpRequest = class MockSyncRangeXhr {
+        status = 0;
+        responseType = '';
+        response: unknown = null;
+        private rangeHeader: string | null = null;
+        private method = 'GET';
+        open(m: string) {
+          this.method = m;
+        }
+        setRequestHeader(k: string, v: string) {
+          if (k.toLowerCase() === 'range') {
+            this.rangeHeader = v;
+          }
+        }
+        getResponseHeader(name: string) {
+          if (this.method === 'HEAD' && name.toLowerCase() === 'content-length') {
+            return String(128 * 1024 * 1024);
+          }
+          return null;
+        }
+        send() {
+          if (this.method === 'HEAD') {
+            this.status = 200;
+            return;
+          }
+          const m = /^bytes=(\d+)-(\d+)$/.exec(this.rangeHeader ?? '');
+          const start = m ? Number(m[1]) : 0;
+          const end = m ? Number(m[2]) : 0;
+          const slice = new Uint8Array(end - start + 1);
+          for (let i = 0; i < slice.length; i += 1) {
+            slice[i] = (start + i) & 0xff;
+          }
+          this.status = 206;
+          this.response = slice.buffer;
+        }
+      };
+
+      const bridge2 = new ExternalDataSessionBridge();
+      bridge2.registerUrl('decoder_model_merged_q4f16.onnx_data', decoderUrl);
+      const rangeSessionOpts: { externalData: Array<string | { path: string; data: Uint8Array }> } = {
+        externalData: ['decoder_model_merged_q4f16.onnx_data'],
+      };
+      await bridge2.prepareSessionExternalData(rangeSessionOpts, {
+        opfsRoot: null,
+        cacheName: 'transformers-cache',
+      });
+      const rangeProxy = (rangeSessionOpts.externalData[0] as { path: string; data: Uint8Array }).data;
+      expect(rangeProxy.byteLength).toBe(128 * 1024 * 1024);
+      expect(rangeProxy.subarray(200, 204)).toEqual(new Uint8Array([200, 201, 202, 203]));
+      expect(arrayBufferOomTrap).not.toHaveBeenCalled();
+
+      // Case 3: Mid-session proxy error persists across closeAll() until consumeLastReadError()
+      bridge2.closeAll();
+      const postCloseProxy = (rangeSessionOpts.externalData[0] as { path: string; data: Uint8Array })
+        .data;
+      expect(() => postCloseProxy.subarray(0, 4)).toThrow(/already closed/);
+      const consumed = bridge2.consumeLastReadError();
+      expect(consumed).not.toBeNull();
+      expect(consumed!.url).toBe(decoderUrl);
+      expect(consumed!.offset).toBe(0);
+      expect(consumed!.length).toBe(4);
+      expect(bridge2.consumeLastReadError()).toBeNull();
+
+      // Case 4: Both local sync NotReadableError & Range unavailable -> throws original NotReadableError
+      g.XMLHttpRequest = undefined;
+      const bridge3 = new ExternalDataSessionBridge();
+      bridge3.registerUrl('decoder_model_merged_q4f16.onnx_data', decoderUrl);
+      await expect(
+        bridge3.prepareSessionExternalData(
+          { externalData: ['decoder_model_merged_q4f16.onnx_data'] },
+          { opfsRoot: null, cacheName: 'transformers-cache' }
+        )
+      ).rejects.toMatchObject({ name: 'NotReadableError' });
+      bridge3.closeAll();
+    } finally {
+      g.FileReaderSync = origFrs;
+      g.caches = origCaches;
+      g.XMLHttpRequest = origXhr;
+    }
+  });
+
+  it('enrichModelLoadError + classifyModelLoadError surface swallowed memory-copy root causes cleanly', () => {
+    const ortMemCopyErr = new Error(
+      "Can't create a session. ERROR_CODE: 1, ERROR_MESSAGE: Deserialize tensor model_layers_0_attn_k_proj_MatMul_weight_zp failed.Failed to load external data file \"decoder_model_merged_q4f16.onnx_data\", error: Unknown error occurred in memory copy."
+    );
+    const notReadable = new DOMException('The requested file could not be read', 'NotReadableError');
+    const enrichedRead = enrichModelLoadError(
+      ortMemCopyErr,
+      {
+        url: 'https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/onnx/decoder_model_merged_q4f16.onnx_data',
+        offset: 211876864,
+        length: 6144,
+        error: notReadable,
+      },
+      null
+    );
+    const classifiedRead = classifyModelLoadError(enrichedRead);
+    expect(classifiedRead.code).toBe('EXTERNAL_DATA_READ_FAILED');
+    expect(classifiedRead.message).toContain('NotReadableError');
+    expect(classifiedRead.message).toContain('211876864+6144');
+
+    // Enriched WebGPU device lost or limit error retains high-priority specific classification
+    const enrichedLost = enrichModelLoadError(
+      ortMemCopyErr,
+      null,
+      new Error('Queue submit failed: WebGPU device is lost')
+    );
+    expect(classifyModelLoadError(enrichedLost).code).toBe('WEBGPU_DEVICE_LOST');
+
+    // Un-enriched ORT memory copy error also classifies as EXTERNAL_DATA_READ_FAILED
+    expect(classifyModelLoadError(ortMemCopyErr).code).toBe('EXTERNAL_DATA_READ_FAILED');
   });
 });
